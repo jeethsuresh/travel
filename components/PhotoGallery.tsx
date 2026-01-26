@@ -29,6 +29,8 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
   const [error, setError] = useState<string | null>(null);
   const [showCamera, setShowCamera] = useState(false);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -418,6 +420,9 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
       if (!confirm("Are you sure you want to delete this photo?")) return;
 
+      // Optimistically remove from UI
+      setPhotos((prevPhotos) => prevPhotos.filter((p) => p.id !== photo.id));
+
       try {
         // Delete from storage (with path validation)
         const { error: storageError } = await supabase.storage
@@ -435,7 +440,6 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
         if (dbError) throw dbError;
 
-        await fetchPhotos();
         // Notify parent component
         if (onPhotosUpdate) {
           onPhotosUpdate();
@@ -443,10 +447,90 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       } catch (error) {
         console.error("Error deleting photo:", error);
         setError("Failed to delete photo");
+        // Revert optimistic update on error
+        await fetchPhotos();
       }
     },
     [user, supabase, fetchPhotos, onPhotosUpdate]
   );
+
+  const deleteSelectedPhotos = useCallback(
+    async () => {
+      if (!user || selectedPhotos.size === 0) return;
+
+      const photosToDelete = photos.filter((p) => selectedPhotos.has(p.id));
+
+      // Security check: Verify all photos belong to current user
+      const invalidPhotos = photosToDelete.filter(
+        (p) => p.user_id !== user.id || !p.storage_path.startsWith(`${user.id}/`)
+      );
+
+      if (invalidPhotos.length > 0) {
+        setError("Some photos cannot be deleted");
+        return;
+      }
+
+      if (!confirm(`Are you sure you want to delete ${selectedPhotos.size} photo(s)?`)) return;
+
+      // Optimistically remove from UI
+      setPhotos((prevPhotos) => prevPhotos.filter((p) => !selectedPhotos.has(p.id)));
+
+      try {
+        // Delete from storage
+        const storagePaths = photosToDelete.map((p) => p.storage_path);
+        const { error: storageError } = await supabase.storage
+          .from("photos")
+          .remove(storagePaths);
+
+        if (storageError) throw storageError;
+
+        // Delete from database
+        const photoIds = Array.from(selectedPhotos);
+        const { error: dbError } = await supabase
+          .from("photos")
+          .delete()
+          .in("id", photoIds)
+          .eq("user_id", user.id);
+
+        if (dbError) throw dbError;
+
+        // Clear selection and exit selection mode
+        setSelectedPhotos(new Set());
+        setSelectionMode(false);
+
+        // Notify parent component
+        if (onPhotosUpdate) {
+          onPhotosUpdate();
+        }
+      } catch (error) {
+        console.error("Error deleting photos:", error);
+        setError("Failed to delete some photos");
+        // Revert optimistic update on error
+        await fetchPhotos();
+      }
+    },
+    [user, supabase, selectedPhotos, photos, onPhotosUpdate, fetchPhotos]
+  );
+
+  const togglePhotoSelection = useCallback((photoId: string) => {
+    setSelectedPhotos((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(photoId)) {
+        newSet.delete(photoId);
+      } else {
+        newSet.add(photoId);
+      }
+      return newSet;
+    });
+  }, []);
+
+  const toggleSelectAll = useCallback(() => {
+    if (selectedPhotos.size === photos.length) {
+      setSelectedPhotos(new Set());
+    } else {
+      setSelectedPhotos(new Set(photos.map((p) => p.id)));
+    }
+  }, [photos, selectedPhotos]);
 
   useEffect(() => {
     return () => {
@@ -471,19 +555,54 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           Photos
         </h2>
         <div className="flex gap-2">
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
-          >
-            {uploading ? "Uploading..." : "Upload Photos"}
-          </button>
-          <button
-            onClick={showCamera ? stopCamera : startCamera}
-            className="px-4 py-2 bg-green-500 hover:bg-green-600 text-white rounded-md text-sm font-medium"
-          >
-            {showCamera ? "Cancel" : "Camera"}
-          </button>
+          {selectionMode ? (
+            <>
+              <button
+                onClick={toggleSelectAll}
+                className="px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white rounded-md text-sm font-medium"
+              >
+                {selectedPhotos.size === photos.length ? "Deselect All" : "Select All"}
+              </button>
+              <button
+                onClick={deleteSelectedPhotos}
+                disabled={selectedPhotos.size === 0}
+                className="px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
+              >
+                Delete ({selectedPhotos.size})
+              </button>
+              <button
+                onClick={() => {
+                  setSelectionMode(false);
+                  setSelectedPhotos(new Set());
+                }}
+                className="px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white rounded-md text-sm font-medium"
+              >
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => setSelectionMode(true)}
+                className="px-4 py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-md text-sm font-medium"
+              >
+                Select
+              </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
+              >
+                {uploading ? "Uploading..." : "Upload Photos"}
+              </button>
+              <button
+                onClick={showCamera ? stopCamera : startCamera}
+                className="px-4 py-2 bg-green-500 hover:bg-green-600 text-white rounded-md text-sm font-medium"
+              >
+                {showCamera ? "Cancel" : "Camera"}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -561,15 +680,32 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           {photos.map((photo) => (
             <div
               key={photo.id}
-              className="relative group aspect-square rounded-lg overflow-hidden bg-gray-100 dark:bg-zinc-800"
+              className={`relative group aspect-square rounded-lg overflow-hidden bg-gray-100 dark:bg-zinc-800 ${
+                selectionMode && selectedPhotos.has(photo.id) ? "ring-4 ring-blue-500" : ""
+              }`}
             >
+              {selectionMode && (
+                <div className="absolute top-2 left-2 z-10">
+                  <input
+                    type="checkbox"
+                    checked={selectedPhotos.has(photo.id)}
+                    onChange={() => togglePhotoSelection(photo.id)}
+                    className="w-6 h-6 cursor-pointer"
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </div>
+              )}
               {photo.url ? (
                 <img
                   src={photo.url}
                   alt={`Photo from ${new Date(photo.timestamp).toLocaleDateString()}`}
-                  className="w-full h-full object-cover cursor-pointer"
+                  className={`w-full h-full object-cover ${
+                    selectionMode ? "cursor-pointer" : "cursor-pointer"
+                  }`}
                   onClick={() => {
-                    if (photo.latitude && photo.longitude && onPhotoClick) {
+                    if (selectionMode) {
+                      togglePhotoSelection(photo.id);
+                    } else if (photo.latitude && photo.longitude && onPhotoClick) {
                       onPhotoClick(photo);
                     }
                   }}
@@ -579,42 +715,44 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
                   <p className="text-gray-400 text-sm">Loading...</p>
                 </div>
               )}
-              <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-50 transition-opacity flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100">
-                {photo.latitude && photo.longitude && (
+              {!selectionMode && (
+                <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-50 transition-opacity flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100">
+                  {photo.latitude && photo.longitude && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (onPhotoClick) {
+                          onPhotoClick(photo);
+                        }
+                      }}
+                      className="px-3 py-2 bg-green-500 hover:bg-green-600 text-white rounded-md text-sm"
+                      title="Show on Map"
+                    >
+                      Map
+                    </button>
+                  )}
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (onPhotoClick) {
-                        onPhotoClick(photo);
-                      }
+                      downloadPhoto(photo);
                     }}
-                    className="px-3 py-2 bg-green-500 hover:bg-green-600 text-white rounded-md text-sm"
-                    title="Show on Map"
+                    className="px-3 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm"
+                    title="Download/Save to Camera Roll"
                   >
-                    Map
+                    Download
                   </button>
-                )}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    downloadPhoto(photo);
-                  }}
-                  className="px-3 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm"
-                  title="Download/Save to Camera Roll"
-                >
-                  Download
-                </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deletePhoto(photo);
-                  }}
-                  className="px-3 py-2 bg-red-500 hover:bg-red-600 text-white rounded-md text-sm"
-                  title="Delete"
-                >
-                  Delete
-                </button>
-              </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deletePhoto(photo);
+                    }}
+                    className="px-3 py-2 bg-red-500 hover:bg-red-600 text-white rounded-md text-sm"
+                    title="Delete"
+                  >
+                    Delete
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>
