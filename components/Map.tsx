@@ -999,11 +999,6 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
     }
   }, [focusLocation]);
 
-  const pathCoordinates: [number, number][] = locations.map((loc) => [
-    loc.lat,
-    loc.lng,
-  ]);
-
   // Force recalculation of clustering on every viewport/zoom change
   // The threshold is now based on viewport size (percentage of visible map):
   // - More zoomed in = smaller viewport = smaller threshold = items must be closer to cluster
@@ -1044,6 +1039,109 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
     return groups;
   }, [photos, viewportThreshold, zoomLevel]);
 
+  // Filter out locations that fall within photo clusters
+  const visibleLocations = useMemo((): Location[] => {
+    if (photoGroups.length === 0) return locations;
+    
+    const threshold = Math.max(viewportThreshold, 0.00001);
+    const excludedLocations = new Set<string>();
+    
+    // Check each location against each photo cluster
+    locations.forEach((location, index) => {
+      photoGroups.forEach((group) => {
+        // For clusters, check distance from location to cluster center
+        if (group.photos.length > 1) {
+          const distance = getDistance(
+            location.lat,
+            location.lng,
+            group.center[0],
+            group.center[1]
+          );
+          if (distance <= threshold) {
+            excludedLocations.add(`location-${index}`);
+          }
+        } else {
+          // For individual photos, check distance from location to photo
+          const photo = group.photos[0];
+          const distance = getDistance(
+            location.lat,
+            location.lng,
+            photo.latitude,
+            photo.longitude
+          );
+          if (distance <= threshold) {
+            excludedLocations.add(`location-${index}`);
+          }
+        }
+      });
+    });
+    
+    return locations.filter((_, index) => !excludedLocations.has(`location-${index}`));
+  }, [locations, photoGroups, viewportThreshold]);
+
+  // Create sequential timeline connections between events (photos and locations)
+  const timelineConnections = useMemo(() => {
+    const connections: Array<{ 
+      from: [number, number]; 
+      to: [number, number];
+    }> = [];
+    
+    // Create a combined timeline of all events (photos and locations) sorted by timestamp
+    interface TimelineEvent {
+      position: [number, number];
+      timestamp: number;
+      type: 'photo' | 'location';
+    }
+    
+    const events: TimelineEvent[] = [];
+    
+    // Add photo groups to timeline
+    photoGroups.forEach((group) => {
+      const photoPosition: [number, number] = group.photos.length > 1 
+        ? group.center 
+        : [group.photos[0].latitude, group.photos[0].longitude];
+      
+      // Use the earliest photo timestamp in the group
+      const photoTimestamps = group.photos.map(p => new Date(p.timestamp).getTime());
+      const earliestPhotoTime = Math.min(...photoTimestamps);
+      
+      events.push({
+        position: photoPosition,
+        timestamp: earliestPhotoTime,
+        type: 'photo',
+      });
+    });
+    
+    // Add locations to timeline
+    locations.forEach((location) => {
+      events.push({
+        position: [location.lat, location.lng],
+        timestamp: new Date(location.timestamp).getTime(),
+        type: 'location',
+      });
+    });
+    
+    // Sort events by timestamp
+    events.sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Connect each event to the next event in chronological order
+    for (let i = 0; i < events.length - 1; i++) {
+      connections.push({
+        from: events[i].position,
+        to: events[i + 1].position,
+      });
+    }
+    
+    console.log(`[Timeline] Created ${connections.length} sequential connections from ${events.length} events`);
+    
+    return connections;
+  }, [photoGroups, locations]);
+
+  // Use visibleLocations for path coordinates (calculated after filtering)
+  const pathCoordinates: [number, number][] = useMemo(() => {
+    return visibleLocations.map((loc) => [loc.lat, loc.lng]);
+  }, [visibleLocations]);
+
   return (
     <div className="w-full h-full relative">
       <MapContainer
@@ -1071,13 +1169,27 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
           />
         )}
         
-        {/* Breadcrumb markers - small dots for each location */}
-        {locations.map((location, index) => {
+        {/* Timeline connections - sequential lines connecting events chronologically */}
+        {timelineConnections.map((connection, index) => (
+          <Polyline
+            key={`timeline-${index}`}
+            positions={[
+              connection.from,
+              connection.to,
+            ]}
+            color="#8b5cf6"
+            weight={2}
+            opacity={0.6}
+          />
+        ))}
+        
+        {/* Breadcrumb markers - small dots for each location (excluding those in clusters) */}
+        {visibleLocations.map((location, index) => {
           const isStart = index === 0;
-          const isEnd = index === locations.length - 1;
+          const isEnd = index === visibleLocations.length - 1;
           
           // Use special icons for start and end, breadcrumb dots for the rest
-          if (isStart && locations.length > 1) {
+          if (isStart && visibleLocations.length > 1) {
             return (
               <Marker
                 key={`start-${index}`}
@@ -1085,7 +1197,7 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
                 icon={createStartIcon()}
               />
             );
-          } else if (isEnd && locations.length > 1) {
+          } else if (isEnd && visibleLocations.length > 1) {
             return (
               <Marker
                 key={`end-${index}`}
@@ -1105,10 +1217,10 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
           }
         })}
         
-        {/* If only one location, show it as a regular marker */}
-        {locations.length === 1 && (
+        {/* If only one visible location, show it as a regular marker */}
+        {visibleLocations.length === 1 && (
           <Marker
-            position={[locations[0].lat, locations[0].lng]}
+            position={[visibleLocations[0].lat, visibleLocations[0].lng]}
             icon={createBreadcrumbIcon("#3b82f6", 8)}
           />
         )}
