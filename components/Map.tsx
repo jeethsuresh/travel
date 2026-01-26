@@ -426,7 +426,7 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
         
         {/* Photo location markers - show all photos with location data */}
         {photos.map((photo) => {
-          const isFocused = focusLocation && 
+          const isFocused = !!focusLocation && 
             Math.abs(photo.latitude - focusLocation.latitude) < 0.0001 &&
             Math.abs(photo.longitude - focusLocation.longitude) < 0.0001;
           

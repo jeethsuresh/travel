@@ -1,7 +1,10 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import dynamic from "next/dynamic";
+import { useEffect, useState, useCallback, useMemo } from "react";
+
+// Force dynamic rendering to prevent build-time Supabase client creation
+export const dynamic = 'force-dynamic';
+import dynamicImport from "next/dynamic";
 import { createClient } from "@/lib/supabase/client";
 import Auth from "@/components/Auth";
 import LocationHistory from "@/components/LocationHistory";
@@ -9,7 +12,7 @@ import PhotoGallery from "@/components/PhotoGallery";
 import type { User } from "@supabase/supabase-js";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
-const Map = dynamic(() => import("@/components/Map"), {
+const Map = dynamicImport(() => import("@/components/Map"), {
   ssr: false,
   loading: () => <div className="flex items-center justify-center h-full">Loading map...</div>,
 });
@@ -28,15 +31,31 @@ interface Photo {
   timestamp: string;
 }
 
+interface PhotoWithLocation {
+  id: string;
+  latitude: number;
+  longitude: number;
+  timestamp: string;
+}
+
 export default function Home() {
   const [user, setUser] = useState<User | null>(null);
   const [locations, setLocations] = useState<Location[]>([]);
-  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [photos, setPhotos] = useState<PhotoWithLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [focusLocation, setFocusLocation] = useState<{ latitude: number; longitude: number } | null>(null);
-  const supabase = createClient();
+  
+  // Lazy initialization of Supabase client to avoid issues during build
+  const supabase = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+    return createClient();
+  }, []);
 
   useEffect(() => {
+    if (!supabase) return;
+    
     supabase.auth.getUser().then(({ data: { user } }) => {
       setUser(user);
       setLoading(false);
@@ -49,10 +68,10 @@ export default function Home() {
     });
 
     return () => subscription.unsubscribe();
-  }, [supabase.auth]);
+  }, [supabase]);
 
   const fetchLocations = useCallback(async () => {
-    if (!user) {
+    if (!user || !supabase) {
       setLocations([]);
       return;
     }
@@ -72,7 +91,7 @@ export default function Home() {
   }, [user, supabase]);
 
   const fetchPhotos = useCallback(async () => {
-    if (!user) {
+    if (!user || !supabase) {
       setPhotos([]);
       return;
     }
@@ -87,7 +106,7 @@ export default function Home() {
         .order("timestamp", { ascending: false });
 
       if (error) throw error;
-      setPhotos((data || []).filter((photo): photo is Photo => 
+      setPhotos((data || []).filter((photo): photo is PhotoWithLocation => 
         photo.latitude !== null && photo.longitude !== null
       ));
     } catch (error) {
