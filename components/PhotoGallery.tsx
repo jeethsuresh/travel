@@ -99,20 +99,58 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
     }
   }, [user, fetchPhotos]);
 
-  const extractExifLocation = useCallback(async (file: File): Promise<{ latitude?: number; longitude?: number }> => {
+  const extractExifData = useCallback(async (file: File): Promise<{ 
+    latitude?: number; 
+    longitude?: number; 
+    timestamp?: string;
+  }> => {
     try {
-      // Extract EXIF data, specifically GPS coordinates
-      const exifData = await exifr.gps(file);
+      // Extract EXIF data including GPS coordinates and date/time
+      const exifData = await exifr.parse(file, {
+        gps: true,
+        exif: true,
+      });
       
+      const result: { latitude?: number; longitude?: number; timestamp?: string } = {};
+      
+      // Extract GPS coordinates
       if (exifData && exifData.latitude && exifData.longitude) {
-        return {
-          latitude: exifData.latitude,
-          longitude: exifData.longitude,
-        };
+        result.latitude = exifData.latitude;
+        result.longitude = exifData.longitude;
       }
+      
+      // Extract date/time when photo was taken
+      // Try different EXIF date fields (different cameras use different fields)
+      const dateTimeOriginal = exifData?.DateTimeOriginal || exifData?.DateTime || exifData?.CreateDate;
+      
+      if (dateTimeOriginal) {
+        let photoDate: Date;
+        
+        // Handle different date formats
+        if (typeof dateTimeOriginal === 'string') {
+          // EXIF date format is typically "YYYY:MM:DD HH:MM:SS"
+          // Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS" for Date parsing
+          const dateStr = dateTimeOriginal.replace(/(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+          photoDate = new Date(dateStr);
+        } else if (dateTimeOriginal instanceof Date) {
+          photoDate = dateTimeOriginal;
+        } else {
+          // Try to parse as number (Unix timestamp)
+          photoDate = new Date(dateTimeOriginal);
+        }
+        
+        // Validate the date is reasonable (not invalid, not in the future, not too old)
+        if (!isNaN(photoDate.getTime()) && 
+            photoDate.getTime() <= Date.now() && 
+            photoDate.getTime() > new Date('1900-01-01').getTime()) {
+          result.timestamp = photoDate.toISOString();
+        }
+      }
+      
+      return result;
     } catch (error) {
-      // EXIF extraction failed, continue without location
-      console.log("Could not extract EXIF location data:", error);
+      // EXIF extraction failed, continue without EXIF data
+      console.log("Could not extract EXIF data:", error);
     }
     
     return {};
@@ -141,15 +179,20 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           throw new Error("User ID mismatch. Please refresh the page.");
         }
 
-        // Extract EXIF location data from the photo
+        // Extract EXIF data from the photo (location and date/time)
         // Only use location from EXIF (where photo was taken), not upload location
+        // Use date/time from EXIF (when photo was taken), not upload time
         let finalLatitude: number | undefined;
         let finalLongitude: number | undefined;
+        let photoTimestamp: string | undefined;
         
-        const exifLocation = await extractExifLocation(file);
-        if (exifLocation.latitude && exifLocation.longitude) {
-          finalLatitude = exifLocation.latitude;
-          finalLongitude = exifLocation.longitude;
+        const exifData = await extractExifData(file);
+        if (exifData.latitude && exifData.longitude) {
+          finalLatitude = exifData.latitude;
+          finalLongitude = exifData.longitude;
+        }
+        if (exifData.timestamp) {
+          photoTimestamp = exifData.timestamp;
         }
 
         // Generate unique filename
@@ -179,14 +222,22 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
         // Save photo metadata to database
         // Use the authenticated user's ID from the session
-        const { data: insertData, error: dbError } = await supabase
+        // Use EXIF timestamp if available, otherwise use current time
+        const insertData: any = {
+          user_id: authUser.id, // Use authUser.id to ensure it matches auth.uid()
+          storage_path: fileName,
+          latitude: finalLatitude || null,
+          longitude: finalLongitude || null,
+        };
+        
+        // Set timestamp from EXIF if available, otherwise let database use default (NOW())
+        if (photoTimestamp) {
+          insertData.timestamp = photoTimestamp;
+        }
+        
+        const { data: insertedPhoto, error: dbError } = await supabase
           .from("photos")
-          .insert({
-            user_id: authUser.id, // Use authUser.id to ensure it matches auth.uid()
-            storage_path: fileName,
-            latitude: finalLatitude || null,
-            longitude: finalLongitude || null,
-          })
+          .insert(insertData)
           .select()
           .single();
 
@@ -211,7 +262,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         throw error;
       }
     },
-    [user, supabase, extractExifLocation]
+    [user, supabase, extractExifData]
   );
 
   const handleFileSelect = useCallback(
