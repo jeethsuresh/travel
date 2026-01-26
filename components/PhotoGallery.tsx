@@ -25,6 +25,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ [key: string]: number }>({});
   const [error, setError] = useState<string | null>(null);
   const [showCamera, setShowCamera] = useState(false);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
@@ -116,14 +117,15 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
   }, []);
 
   const uploadPhoto = useCallback(
-    async (file: File, latitude?: number, longitude?: number) => {
+    async (file: File, latitude?: number, longitude?: number, fileId?: string) => {
       if (!user) {
         setError("Please sign in to upload photos");
         return;
       }
 
-      setUploading(true);
-      setError(null);
+      if (fileId) {
+        setUploadProgress((prev) => ({ ...prev, [fileId]: 0 }));
+      }
 
       try {
         // Verify authentication session before proceeding
@@ -151,7 +153,11 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
         // Generate unique filename
         const fileExt = file.name.split(".").pop();
-        const fileName = `${user.id}/${Date.now()}.${fileExt}`;
+        const fileName = `${user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
+
+        if (fileId) {
+          setUploadProgress((prev) => ({ ...prev, [fileId]: 30 }));
+        }
 
         // Upload to Supabase Storage
         const { error: uploadError } = await supabase.storage
@@ -164,6 +170,10 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         if (uploadError) {
           console.error("Storage upload error:", uploadError);
           throw uploadError;
+        }
+
+        if (fileId) {
+          setUploadProgress((prev) => ({ ...prev, [fileId]: 70 }));
         }
 
         // Save photo metadata to database
@@ -185,28 +195,33 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           throw dbError;
         }
 
-        // Refresh photos list
-        await fetchPhotos();
-        // Notify parent component
-        if (onPhotosUpdate) {
-          onPhotosUpdate();
+        if (fileId) {
+          setUploadProgress((prev) => ({ ...prev, [fileId]: 100 }));
         }
       } catch (error: any) {
         console.error("Error uploading photo:", error);
-        setError(error.message || "Failed to upload photo");
-      } finally {
-        setUploading(false);
+        if (fileId) {
+          setUploadProgress((prev) => {
+            const newPrev = { ...prev };
+            delete newPrev[fileId];
+            return newPrev;
+          });
+        }
+        throw error;
       }
     },
-    [user, supabase, fetchPhotos, extractExifLocation, onPhotosUpdate]
+    [user, supabase, extractExifLocation]
   );
 
   const handleFileSelect = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
+      const files = Array.from(e.target.files || []);
+      if (files.length === 0) return;
 
-      // Get current location if available
+      setUploading(true);
+      setError(null);
+
+      // Get current location if available (shared for all photos)
       let latitude: number | undefined;
       let longitude: number | undefined;
 
@@ -226,12 +241,39 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         }
       }
 
-      await uploadPhoto(file, latitude, longitude);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+      // Upload all files concurrently
+      const uploadPromises = files.map((file, index) => {
+        const fileId = `${Date.now()}-${index}`;
+        return uploadPhoto(file, latitude, longitude, fileId).catch((error) => {
+          console.error(`Error uploading ${file.name}:`, error);
+          return null;
+        });
+      });
+
+      try {
+        await Promise.all(uploadPromises);
+        
+        // Refresh photos list after all uploads complete
+        await fetchPhotos();
+        // Notify parent component
+        if (onPhotosUpdate) {
+          onPhotosUpdate();
+        }
+        
+        // Clear progress after a short delay
+        setTimeout(() => {
+          setUploadProgress({});
+        }, 1000);
+      } catch (error: any) {
+        setError(error.message || "Failed to upload some photos");
+      } finally {
+        setUploading(false);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
       }
     },
-    [uploadPhoto]
+    [uploadPhoto, fetchPhotos, onPhotosUpdate]
   );
 
   const startCamera = useCallback(async () => {
@@ -281,6 +323,9 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
     canvas.toBlob(async (blob) => {
       if (!blob) return;
 
+      setUploading(true);
+      setError(null);
+
       // Get current location if available
       let latitude: number | undefined;
       let longitude: number | undefined;
@@ -306,10 +351,23 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         type: "image/jpeg",
       });
 
-      await uploadPhoto(file, latitude, longitude);
-      stopCamera();
+      try {
+        await uploadPhoto(file, latitude, longitude);
+        // Refresh photos list after upload
+        await fetchPhotos();
+        // Notify parent component
+        if (onPhotosUpdate) {
+          onPhotosUpdate();
+        }
+        stopCamera();
+      } catch (error: any) {
+        console.error("Error uploading captured photo:", error);
+        setError(error.message || "Failed to upload photo");
+      } finally {
+        setUploading(false);
+      }
     }, "image/jpeg", 0.9);
-  }, [uploadPhoto, stopCamera]);
+  }, [uploadPhoto, stopCamera, fetchPhotos, onPhotosUpdate]);
 
   const downloadPhoto = useCallback(async (photo: Photo) => {
     if (!user) {
@@ -457,7 +515,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
             disabled={uploading}
             className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
           >
-            {uploading ? "Uploading..." : "Upload"}
+            {uploading ? "Uploading..." : "Upload Photos"}
           </button>
           <button
             onClick={showCamera ? stopCamera : startCamera}
@@ -472,6 +530,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         ref={fileInputRef}
         type="file"
         accept="image/*"
+        multiple
         onChange={handleFileSelect}
         className="hidden"
       />
@@ -479,6 +538,24 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       {error && (
         <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
           <p className="text-red-800 dark:text-red-200 text-sm">{error}</p>
+        </div>
+      )}
+
+      {uploading && Object.keys(uploadProgress).length > 0 && (
+        <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md">
+          <p className="text-blue-800 dark:text-blue-200 text-sm mb-2">
+            Uploading {Object.keys(uploadProgress).length} photo(s)...
+          </p>
+          <div className="space-y-2">
+            {Object.entries(uploadProgress).map(([fileId, progress]) => (
+              <div key={fileId} className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                <div
+                  className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
