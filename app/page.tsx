@@ -37,6 +37,7 @@ interface PhotoWithLocation {
   latitude: number;
   longitude: number;
   timestamp: string;
+  storage_path?: string;
 }
 
 export default function Home() {
@@ -100,7 +101,7 @@ export default function Home() {
     try {
       const { data, error } = await supabase
         .from("photos")
-        .select("id, latitude, longitude, timestamp")
+        .select("id, latitude, longitude, timestamp, storage_path")
         .eq("user_id", user.id)
         .not("latitude", "is", null)
         .not("longitude", "is", null)
