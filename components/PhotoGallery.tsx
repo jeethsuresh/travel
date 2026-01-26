@@ -139,16 +139,15 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           throw new Error("User ID mismatch. Please refresh the page.");
         }
 
-        // Extract EXIF location data if not provided
-        let finalLatitude = latitude;
-        let finalLongitude = longitude;
+        // Extract EXIF location data from the photo
+        // Only use location from EXIF (where photo was taken), not upload location
+        let finalLatitude: number | undefined;
+        let finalLongitude: number | undefined;
         
-        if (!finalLatitude || !finalLongitude) {
-          const exifLocation = await extractExifLocation(file);
-          if (exifLocation.latitude && exifLocation.longitude) {
-            finalLatitude = exifLocation.latitude;
-            finalLongitude = exifLocation.longitude;
-          }
+        const exifLocation = await extractExifLocation(file);
+        if (exifLocation.latitude && exifLocation.longitude) {
+          finalLatitude = exifLocation.latitude;
+          finalLongitude = exifLocation.longitude;
         }
 
         // Generate unique filename
@@ -221,30 +220,11 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       setUploading(true);
       setError(null);
 
-      // Get current location if available (shared for all photos)
-      let latitude: number | undefined;
-      let longitude: number | undefined;
-
-      if (navigator.geolocation) {
-        try {
-          const position = await new Promise<GeolocationPosition>(
-            (resolve, reject) => {
-              navigator.geolocation.getCurrentPosition(resolve, reject, {
-                timeout: 5000,
-              });
-            }
-          );
-          latitude = position.coords.latitude;
-          longitude = position.coords.longitude;
-        } catch (error) {
-          // Location not available, continue without it
-        }
-      }
-
       // Upload all files concurrently
+      // Location will be extracted from EXIF data in each photo
       const uploadPromises = files.map((file, index) => {
         const fileId = `${Date.now()}-${index}`;
-        return uploadPhoto(file, latitude, longitude, fileId).catch((error) => {
+        return uploadPhoto(file, undefined, undefined, fileId).catch((error) => {
           console.error(`Error uploading ${file.name}:`, error);
           return null;
         });
@@ -326,33 +306,14 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       setUploading(true);
       setError(null);
 
-      // Get current location if available
-      let latitude: number | undefined;
-      let longitude: number | undefined;
-
-      if (navigator.geolocation) {
-        try {
-          const position = await new Promise<GeolocationPosition>(
-            (resolve, reject) => {
-              navigator.geolocation.getCurrentPosition(resolve, reject, {
-                timeout: 5000,
-              });
-            }
-          );
-          latitude = position.coords.latitude;
-          longitude = position.coords.longitude;
-        } catch (error) {
-          // Location not available, continue without it
-        }
-      }
-
       // Create file from blob
       const file = new File([blob], `photo-${Date.now()}.jpg`, {
         type: "image/jpeg",
       });
 
       try {
-        await uploadPhoto(file, latitude, longitude);
+        // Location will be extracted from EXIF data if available
+        await uploadPhoto(file, undefined, undefined);
         // Refresh photos list after upload
         await fetchPhotos();
         // Notify parent component
