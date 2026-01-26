@@ -64,6 +64,7 @@ interface Location {
   lat: number;
   lng: number;
   timestamp: string;
+  wait_time?: number;
 }
 
 interface Photo {
@@ -106,6 +107,24 @@ const checkPermissionStatus = async (): Promise<PermissionState | null> => {
   }
 };
 
+// Calculate distance between two coordinates using Haversine formula (returns distance in meters)
+const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
+  const R = 6371000; // Earth's radius in meters
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+// Proximity threshold in meters (50 meters = ~164 feet)
+const PROXIMITY_THRESHOLD = 50;
+
 function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLocationUpdate: () => void }) {
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [isTracking, setIsTracking] = useState(false);
@@ -113,6 +132,7 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
   const [isRequesting, setIsRequesting] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<PermissionState | null>(null);
   const watchIdRef = useRef<number | null>(null);
+  const lastLocationRef = useRef<{ lat: number; lng: number; id: string; timestamp: string } | null>(null);
   const supabase = createClient();
 
   // Check permission status on mount
@@ -126,14 +146,84 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
     if (!user) return;
 
     try {
-      const { error } = await supabase.from("locations").insert({
-        user_id: user.id,
-        latitude: lat,
-        longitude: lng,
-        timestamp: new Date().toISOString(),
-      });
+      const now = new Date();
+      const nowISO = now.toISOString();
 
-      if (error) throw error;
+      // Check if we have a last location and if it's close enough
+      if (lastLocationRef.current) {
+        const distance = calculateDistance(
+          lastLocationRef.current.lat,
+          lastLocationRef.current.lng,
+          lat,
+          lng
+        );
+
+        // If within proximity threshold, update wait_time instead of creating new entry
+        if (distance < PROXIMITY_THRESHOLD) {
+          const lastTimestamp = new Date(lastLocationRef.current.timestamp);
+          const timeDiff = Math.floor((now.getTime() - lastTimestamp.getTime()) / 1000); // seconds
+
+          // Fetch current wait_time and update it
+          const { data: currentLocation, error: fetchError } = await supabase
+            .from("locations")
+            .select("wait_time")
+            .eq("id", lastLocationRef.current.id)
+            .single();
+
+          if (fetchError) throw fetchError;
+
+          const newWaitTime = (currentLocation?.wait_time || 0) + timeDiff;
+
+          // Update the existing location with new wait_time and timestamp
+          const { error: updateError } = await supabase
+            .from("locations")
+            .update({
+              wait_time: newWaitTime,
+              timestamp: nowISO, // Update timestamp to reflect last update
+            })
+            .eq("id", lastLocationRef.current.id)
+            .eq("user_id", user.id);
+
+          if (updateError) throw updateError;
+
+          // Update the ref with new timestamp
+          lastLocationRef.current = {
+            ...lastLocationRef.current,
+            lat,
+            lng,
+            timestamp: nowISO,
+          };
+
+          onLocationUpdate();
+          return;
+        }
+      }
+
+      // If not close to last location, create a new entry
+      const { data: newLocation, error: insertError } = await supabase
+        .from("locations")
+        .insert({
+          user_id: user.id,
+          latitude: lat,
+          longitude: lng,
+          timestamp: nowISO,
+          wait_time: 0, // New location starts with 0 wait time
+        })
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
+
+      // Update the ref with the new location
+      if (newLocation) {
+        lastLocationRef.current = {
+          lat: newLocation.latitude,
+          lng: newLocation.longitude,
+          id: newLocation.id,
+          timestamp: newLocation.timestamp,
+        };
+      }
+
       onLocationUpdate();
     } catch (error) {
       console.error("Error saving location:", error);
@@ -160,6 +250,32 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
 
     setIsRequesting(true);
     setError(null);
+
+    // Fetch the last location for this user to compare proximity
+    try {
+      const { data: lastLocation, error: fetchError } = await supabase
+        .from("locations")
+        .select("id, latitude, longitude, timestamp")
+        .eq("user_id", user.id)
+        .order("timestamp", { ascending: false })
+        .limit(1)
+        .single();
+
+      if (!fetchError && lastLocation) {
+        lastLocationRef.current = {
+          lat: lastLocation.latitude,
+          lng: lastLocation.longitude,
+          id: lastLocation.id,
+          timestamp: lastLocation.timestamp,
+        };
+      } else {
+        // No previous location or error (which is fine for first time)
+        lastLocationRef.current = null;
+      }
+    } catch (error) {
+      // If there's an error fetching, just start fresh
+      lastLocationRef.current = null;
+    }
 
     // iOS Safari optimized options
     const geoOptions: PositionOptions = {
@@ -250,7 +366,7 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
       },
       geoOptions
     );
-  }, [user, saveLocation]);
+  }, [user, supabase, saveLocation]);
 
   const stopTracking = useCallback(() => {
     setIsTracking(false);
@@ -259,6 +375,8 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
+    // Reset last location ref when stopping tracking
+    lastLocationRef.current = null;
   }, []);
 
   // Cleanup on unmount

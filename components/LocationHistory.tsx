@@ -9,6 +9,7 @@ interface Location {
   latitude: number;
   longitude: number;
   timestamp: string;
+  wait_time?: number;
 }
 
 interface LocationHistoryProps {
@@ -55,6 +56,21 @@ export default function LocationHistory({
   const formatDate = (timestamp: string) => {
     const date = new Date(timestamp);
     return date.toLocaleString();
+  };
+
+  const formatWaitTime = (seconds: number | undefined) => {
+    if (!seconds || seconds === 0) return null;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${secs}s`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${secs}s`;
+    } else {
+      return `${secs}s`;
+    }
   };
 
   if (!user) {
@@ -110,6 +126,11 @@ export default function LocationHistory({
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
                     {formatDate(location.timestamp)}
                   </p>
+                  {location.wait_time && location.wait_time > 0 && (
+                    <p className="text-xs text-blue-600 dark:text-blue-400 mt-1 font-medium">
+                      ⏱️ Waited: {formatWaitTime(location.wait_time)}
+                    </p>
+                  )}
                 </div>
               </div>
             </div>

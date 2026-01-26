@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS locations (
   latitude DOUBLE PRECISION NOT NULL,
   longitude DOUBLE PRECISION NOT NULL,
   timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  wait_time INTEGER NOT NULL DEFAULT 0, -- Time in seconds spent at this location
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -44,6 +45,14 @@ CREATE POLICY "Users can insert their own locations"
   ON locations
   FOR INSERT
   TO authenticated
+  WITH CHECK (auth.uid() = user_id);
+
+-- Create policy: Users can update their own locations
+CREATE POLICY "Users can update their own locations"
+  ON locations
+  FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = user_id)
   WITH CHECK (auth.uid() = user_id);
 
 -- Create policy: Users can delete their own locations

@@ -22,6 +22,7 @@ interface Location {
   latitude: number;
   longitude: number;
   timestamp: string;
+  wait_time?: number;
 }
 
 interface Photo {
