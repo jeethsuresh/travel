@@ -37,7 +37,7 @@ interface PhotoWithLocation {
   latitude: number;
   longitude: number;
   timestamp: string;
-  storage_path?: string;
+  storage_path: string;
 }
 
 export default function Home() {
