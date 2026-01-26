@@ -24,3 +24,10 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Leaflet map container fixes */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  z-index: 0;
+}

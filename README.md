@@ -1,36 +1,114 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Travel Location Tracker
 
-## Getting Started
+A Progressive Web App (PWA) built with Next.js that tracks and displays your location history over time. Features include:
 
-First, run the development server:
+- 🔐 **Supabase Authentication** - Secure user login and signup
+- 🗺️ **Interactive Map** - View your location history on an interactive map using Leaflet
+- 📍 **Location Tracking** - Real-time location tracking with start/stop controls
+- 📊 **Location History** - View and browse your past locations
+- 📱 **PWA Support** - Installable as a mobile app
+
+## Prerequisites
+
+- Node.js 18+ and npm
+- A Supabase account and project
+
+## Setup Instructions
+
+### 1. Install Dependencies
+
+```bash
+npm install
+```
+
+### 2. Set Up Supabase
+
+1. Create a new project at [supabase.com](https://supabase.com)
+2. Go to your project's SQL Editor
+3. Run the SQL script from `supabase/schema.sql` to create the `locations` table and set up Row Level Security policies
+
+### 3. Configure Environment Variables
+
+Create a `.env.local` file in the root directory:
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
+```
+
+You can find these values in your Supabase project settings under API.
+
+### 4. Run the Development Server
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Features
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### Authentication
+- Sign up with email and password
+- Sign in to existing accounts
+- Secure session management with Supabase Auth
 
-## Learn More
+### Location Tracking
+- Click "Start Tracking" to begin recording your location
+- Location data is automatically saved to Supabase
+- Click "Stop Tracking" to pause recording
+- Real-time location updates displayed on the map
 
-To learn more about Next.js, take a look at the following resources:
+### Map View
+- Interactive map showing all recorded locations
+- Polyline connecting all location points
+- Markers for each recorded location
+- Auto-centers on your current location
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Location History
+- View all your past locations in a scrollable list
+- See coordinates and timestamps for each location
+- Refresh button to reload latest data
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Database Schema
 
-## Deploy on Vercel
+The app uses a single `locations` table with the following structure:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- `id` - UUID primary key
+- `user_id` - Foreign key to auth.users
+- `latitude` - Location latitude
+- `longitude` - Location longitude
+- `timestamp` - When the location was recorded
+- `created_at` - Record creation timestamp
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Row Level Security (RLS) is enabled, ensuring users can only access their own location data.
+
+## Building for Production
+
+```bash
+npm run build
+npm start
+```
+
+## PWA Installation
+
+The app is configured as a Progressive Web App. To install:
+
+1. Visit the app in a supported browser (Chrome, Edge, Safari)
+2. Look for the install prompt or use the browser's install option
+3. The app will be installed and can be launched like a native app
+
+**Note:** For full PWA functionality, add icon files (`icon-192x192.png` and `icon-512x512.png`) to the `public` directory. The app will work without them, but installation prompts may not appear.
+
+## Technologies Used
+
+- **Next.js 16** - React framework with App Router
+- **TypeScript** - Type safety
+- **Tailwind CSS** - Styling
+- **Supabase** - Authentication and database
+- **Leaflet** - Interactive maps
+- **next-pwa** - PWA support
+
+## License
+
+MIT
