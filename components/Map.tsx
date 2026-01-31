@@ -6,7 +6,18 @@ import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
-import { fetchImageWithCache } from "@/lib/imageCache";
+import { getCachedImage, fetchImageWithCache } from "@/lib/imageCache";
+import { isNativePlatform } from "@/lib/capacitor";
+import {
+  addPendingLocation,
+  getPendingLocationsForUser,
+  updatePendingLocation,
+  deletePendingLocation,
+  hashTimelineInput,
+  getTimelineCacheSync,
+  setTimelineCacheSync,
+} from "@/lib/localStore";
+import { Geolocation as CapGeolocation } from "@capacitor/geolocation";
 
 // Fix for default marker icons in Next.js - only run on client
 if (typeof window !== "undefined") {
@@ -107,17 +118,32 @@ const isIOSSafari = () => {
   return iOS && webkit && !chrome;
 };
 
-// Check geolocation permission status
+// Check geolocation permission status (web or native)
 const checkPermissionStatus = async (): Promise<PermissionState | null> => {
+  console.log("[Location:permission] checkPermissionStatus entry", { isNative: isNativePlatform(), hasNavigator: typeof navigator !== "undefined", hasPermissions: typeof navigator !== "undefined" && !!navigator.permissions });
+  if (isNativePlatform()) {
+    try {
+      const status = await CapGeolocation.checkPermissions();
+      const loc = status.location;
+      console.log("[Location:permission] checkPermissionStatus native result", { loc });
+      if (loc === "granted" || loc === "denied" || loc === "prompt") return loc;
+      return loc === "prompt-with-rationale" ? "prompt" : null;
+    } catch (e) {
+      console.log("[Location:permission] checkPermissionStatus native error", e);
+      return null;
+    }
+  }
   if (typeof navigator === "undefined" || !navigator.permissions) {
+    console.log("[Location:permission] checkPermissionStatus no navigator.permissions");
     return null;
   }
-  
   try {
+    console.log("[Location:permission] querying navigator.permissions for geolocation...");
     const result = await navigator.permissions.query({ name: "geolocation" as PermissionName });
+    console.log("[Location:permission] checkPermissionStatus web result", { state: result.state });
     return result.state;
   } catch (error) {
-    // Permissions API might not be supported or geolocation might not be queryable
+    console.log("[Location:permission] checkPermissionStatus web error", error);
     return null;
   }
 };
@@ -189,8 +215,15 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
   const [error, setError] = useState<string | null>(null);
   const [isRequesting, setIsRequesting] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<PermissionState | null>(null);
-  const watchIdRef = useRef<number | null>(null);
-  const lastLocationRef = useRef<{ lat: number; lng: number; id: string; timestamp: string } | null>(null);
+  const watchIdRef = useRef<number | string | null>(null); // number for web, string for Capacitor
+  const lastLocationRef = useRef<{
+    lat: number;
+    lng: number;
+    id: string;
+    timestamp: string;
+    isLocal?: boolean;
+    wait_time?: number;
+  } | null>(null);
   const lastSaveTimeRef = useRef<number | null>(null);
   const TRACKING_INTERVAL_MS = 5 * 60 * 1000; // Save location at most once every 5 minutes
   const supabase = createClient();
@@ -202,10 +235,74 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
     });
   }, []);
 
-  const saveLocation = useCallback(async (lat: number, lng: number) => {
+  // Sync any pending locations into Supabase on mount and when user is available (e.g. after reconnect)
+  useEffect(() => {
     if (!user) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const pending = await getPendingLocationsForUser(user.id);
+        if (pending.length === 0 || cancelled) return;
+        console.log("[Location:syncPending] Syncing pending locations to Supabase", { count: pending.length });
+        const { data: { user: authUser } } = await supabase.auth.getUser();
+        if (!authUser || authUser.id !== user.id || cancelled) return;
+        for (const loc of pending) {
+          if (cancelled) return;
+          const { data: inserted, error } = await supabase
+            .from("locations")
+            .insert({
+              user_id: loc.user_id,
+              latitude: loc.latitude,
+              longitude: loc.longitude,
+              timestamp: loc.timestamp,
+              wait_time: loc.wait_time,
+            })
+            .select()
+            .single();
+          if (error) {
+            console.warn("[Location:syncPending] Insert failed for", loc.id, error);
+            continue;
+          }
+          await deletePendingLocation(loc.id);
+          if (lastLocationRef.current?.id === loc.id && inserted) {
+            lastLocationRef.current = {
+              lat: inserted.latitude,
+              lng: inserted.longitude,
+              id: inserted.id,
+              timestamp: inserted.timestamp,
+              isLocal: false,
+            };
+          }
+          onLocationUpdate();
+        }
+      } catch (e) {
+        console.warn("[Location:syncPending] Error", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, supabase, onLocationUpdate]);
+
+  const saveLocation = useCallback(async (lat: number, lng: number) => {
+    console.log("[Location:saveLocation] 1. Entry", { lat, lng, hasUser: !!user });
+    if (!user) {
+      console.log("[Location:saveLocation] 1b. Early return: no user");
+      return;
+    }
 
     try {
+      const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
+      console.log("[Location:saveLocation] 2. Auth", { hasAuthUser: !!authUser, authError: authError?.message });
+      if (authError || !authUser) {
+        setError("Session expired. Please sign in again.");
+        return;
+      }
+      if (authUser.id !== user.id) {
+        setError("Session changed. Please refresh the page.");
+        return;
+      }
+
       const now = new Date();
       const nowISO = now.toISOString();
 
@@ -217,13 +314,35 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
           lat,
           lng
         );
+        console.log("[Location:saveLocation] 3. Proximity check", { distance, threshold: PROXIMITY_THRESHOLD, lastId: lastLocationRef.current.id, isLocal: lastLocationRef.current.isLocal });
 
-        // If within proximity threshold, update wait_time instead of creating new entry
         if (distance < PROXIMITY_THRESHOLD) {
           const lastTimestamp = new Date(lastLocationRef.current.timestamp);
-          const timeDiff = Math.floor((now.getTime() - lastTimestamp.getTime()) / 1000); // seconds
+          const timeDiff = Math.floor((now.getTime() - lastTimestamp.getTime()) / 1000);
 
-          // Fetch current wait_time and update it
+          if (lastLocationRef.current.isLocal) {
+            console.log("[Location:saveLocation] 4a. Updating pending location locally", { id: lastLocationRef.current.id });
+            const currentWait = lastLocationRef.current.wait_time ?? 0;
+            const newWaitTime = currentWait + timeDiff;
+            await updatePendingLocation(lastLocationRef.current.id, {
+              wait_time: newWaitTime,
+              timestamp: nowISO,
+              latitude: lat,
+              longitude: lng,
+            });
+            lastLocationRef.current = {
+              ...lastLocationRef.current,
+              lat,
+              lng,
+              timestamp: nowISO,
+              wait_time: newWaitTime,
+            };
+            console.log("[Location:saveLocation] 4a. Calling onLocationUpdate (after local update)");
+            onLocationUpdate();
+            return;
+          }
+
+          console.log("[Location:saveLocation] 4b. Updating synced location on server", { id: lastLocationRef.current.id });
           const { data: currentLocation, error: fetchError } = await supabase
             .from("locations")
             .select("wait_time")
@@ -234,19 +353,17 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
 
           const newWaitTime = (currentLocation?.wait_time || 0) + timeDiff;
 
-          // Update the existing location with new wait_time and timestamp
           const { error: updateError } = await supabase
             .from("locations")
             .update({
               wait_time: newWaitTime,
-              timestamp: nowISO, // Update timestamp to reflect last update
+              timestamp: nowISO,
             })
             .eq("id", lastLocationRef.current.id)
-            .eq("user_id", user.id);
+            .eq("user_id", authUser.id);
 
           if (updateError) throw updateError;
 
-          // Update the ref with new timestamp
           lastLocationRef.current = {
             ...lastLocationRef.current,
             lat,
@@ -254,100 +371,292 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
             timestamp: nowISO,
           };
 
+          console.log("[Location:saveLocation] 4b. Calling onLocationUpdate (after server update)");
           onLocationUpdate();
           return;
         }
       }
 
-      // If not close to last location, create a new entry
-      const { data: newLocation, error: insertError } = await supabase
-        .from("locations")
-        .insert({
-          user_id: user.id,
-          latitude: lat,
-          longitude: lng,
-          timestamp: nowISO,
-          wait_time: 0, // New location starts with 0 wait time
-        })
-        .select()
-        .single();
+      console.log("[Location:saveLocation] 5. New location: adding to local store");
+      const pending = await addPendingLocation({
+        user_id: authUser.id,
+        latitude: lat,
+        longitude: lng,
+        timestamp: nowISO,
+        wait_time: 0,
+      });
+      console.log("[Location:saveLocation] 5. Pending added", { id: pending.id });
 
-      if (insertError) throw insertError;
+      lastLocationRef.current = {
+        lat: pending.latitude,
+        lng: pending.longitude,
+        id: pending.id,
+        timestamp: pending.timestamp,
+        isLocal: true,
+        wait_time: 0,
+      };
 
-      // Update the ref with the new location
-      if (newLocation) {
-        lastLocationRef.current = {
-          lat: newLocation.latitude,
-          lng: newLocation.longitude,
-          id: newLocation.id,
-          timestamp: newLocation.timestamp,
-        };
-      }
-
+      console.log("[Location:saveLocation] 6. Calling onLocationUpdate (after new pending)");
       onLocationUpdate();
+
+      // Sync to Supabase in background (non-blocking)
+      (async () => {
+        try {
+          console.log("[Location:saveLocation:bg] 7. Background sync: inserting to Supabase", { pendingId: pending.id });
+          const { data: newLocation, error: insertError } = await supabase
+            .from("locations")
+            .insert({
+              user_id: authUser.id,
+              latitude: pending.latitude,
+              longitude: pending.longitude,
+              timestamp: pending.timestamp,
+              wait_time: pending.wait_time,
+            })
+            .select()
+            .single();
+
+          if (insertError) {
+            console.log("[Location:saveLocation:bg] 7. Insert error", insertError);
+            throw insertError;
+          }
+          console.log("[Location:saveLocation:bg] 7. Insert OK", { serverId: newLocation?.id });
+
+          await deletePendingLocation(pending.id);
+          console.log("[Location:saveLocation:bg] 8. Deleted pending from local store");
+
+          if (lastLocationRef.current?.id === pending.id) {
+            lastLocationRef.current = {
+              lat: newLocation.latitude,
+              lng: newLocation.longitude,
+              id: newLocation.id,
+              timestamp: newLocation.timestamp,
+              isLocal: false,
+            };
+          }
+          console.log("[Location:saveLocation:bg] 9. Calling onLocationUpdate (after sync)");
+          onLocationUpdate();
+
+          const remaining = await getPendingLocationsForUser(authUser.id);
+          if (remaining.length > 0) {
+            console.log("[Location:saveLocation:bg] 10. Syncing remaining pending", { count: remaining.length });
+            for (const loc of remaining) {
+              const { data: inserted, error } = await supabase
+                .from("locations")
+                .insert({
+                  user_id: loc.user_id,
+                  latitude: loc.latitude,
+                  longitude: loc.longitude,
+                  timestamp: loc.timestamp,
+                  wait_time: loc.wait_time,
+                })
+                .select()
+                .single();
+              if (!error && inserted) {
+                await deletePendingLocation(loc.id);
+                if (lastLocationRef.current?.id === loc.id) {
+                  lastLocationRef.current = {
+                    lat: inserted.latitude,
+                    lng: inserted.longitude,
+                    id: inserted.id,
+                    timestamp: inserted.timestamp,
+                    isLocal: false,
+                  };
+                }
+              }
+            }
+            onLocationUpdate();
+          }
+        } catch (err) {
+          console.error("[Location:saveLocation:bg] Error:", err);
+        }
+      })();
     } catch (error) {
-      console.error("Error saving location:", error);
+      console.error("[Location:saveLocation] Error:", error);
     }
   }, [user, supabase, onLocationUpdate]);
 
   const startTracking = useCallback(async () => {
+    console.log("[Location:startTracking] 0. Entry", { hasUser: !!user, isNative: isNativePlatform(), hasGeolocation: typeof navigator !== "undefined" && !!navigator?.geolocation });
     if (!user) {
       setError("Please sign in to track your location");
       return;
     }
 
-    if (!navigator.geolocation) {
+    if (!isNativePlatform() && !navigator.geolocation) {
       setError("Geolocation is not supported by your browser");
       return;
     }
 
-    // Check permission status first if available
+    console.log("[Location:startTracking] 0a. Checking permission status...");
     const status = await checkPermissionStatus();
+    console.log("[Location:startTracking] 0b. Permission status", { status });
     if (status === "denied") {
-      setError("Location permission was denied. Please enable location access in your browser settings.");
+      setError(
+        isNativePlatform()
+          ? "Location permission was denied. Enable it in Settings > Privacy > Location."
+          : "Location permission was denied. Please enable location access in your browser settings."
+      );
       return;
     }
 
+    console.log("[Location:startTracking] 0c. Setting isRequesting(true)");
     setIsRequesting(true);
     setError(null);
 
-    // Fetch the last location for this user to compare proximity
-    try {
-      const { data: lastLocation, error: fetchError } = await supabase
-        .from("locations")
-        .select("id, latitude, longitude, timestamp")
-        .eq("user_id", user.id)
-        .order("timestamp", { ascending: false })
-        .limit(1)
-        .single();
+    let requestTimeoutId: ReturnType<typeof setTimeout> | null = null;
+    const REQUEST_TIMEOUT_MS = 25000;
+    requestTimeoutId = setTimeout(() => {
+      console.warn("[Location:startTracking] Timeout: getCurrentPosition did not resolve within", REQUEST_TIMEOUT_MS, "ms — unfreezing button");
+      setIsRequesting(false);
+      requestTimeoutId = null;
+    }, REQUEST_TIMEOUT_MS);
 
-      if (!fetchError && lastLocation) {
-        lastLocationRef.current = {
-          lat: lastLocation.latitude,
-          lng: lastLocation.longitude,
-          id: lastLocation.id,
-          timestamp: lastLocation.timestamp,
-        };
-      } else {
-        // No previous location or error (which is fine for first time)
-        lastLocationRef.current = null;
+    const clearRequestTimeout = () => {
+      if (requestTimeoutId !== null) {
+        clearTimeout(requestTimeoutId);
+        requestTimeoutId = null;
       }
-    } catch (error) {
-      // If there's an error fetching, just start fresh
+    };
+
+    try {
+      console.log("[Location:startTracking] 1. Fetching last location (remote + pending)");
+      const [remoteResult, pendingList] = await Promise.all([
+        supabase
+          .from("locations")
+          .select("id, latitude, longitude, timestamp, wait_time")
+          .eq("user_id", user.id)
+          .order("timestamp", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        getPendingLocationsForUser(user.id),
+      ]);
+
+      const remote = remoteResult.data;
+      const pendingSorted = pendingList
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      const lastPending = pendingSorted[0];
+      console.log("[Location:startTracking] 2. Last location", {
+        hasRemote: !!remote,
+        remoteId: remote?.id,
+        pendingCount: pendingList.length,
+        lastPendingId: lastPending?.id,
+      });
+
+      const remoteTime = remote ? new Date(remote.timestamp).getTime() : 0;
+      const pendingTime = lastPending ? new Date(lastPending.timestamp).getTime() : 0;
+
+      if (pendingTime >= remoteTime && lastPending) {
+        lastLocationRef.current = {
+          lat: lastPending.latitude,
+          lng: lastPending.longitude,
+          id: lastPending.id,
+          timestamp: lastPending.timestamp,
+          isLocal: true,
+          wait_time: lastPending.wait_time,
+        };
+        console.log("[Location:startTracking] 3. Using last pending as ref");
+      } else if (remote) {
+        lastLocationRef.current = {
+          lat: remote.latitude,
+          lng: remote.longitude,
+          id: remote.id,
+          timestamp: remote.timestamp,
+          isLocal: false,
+        };
+        console.log("[Location:startTracking] 3. Using last remote as ref");
+      } else {
+        lastLocationRef.current = null;
+        console.log("[Location:startTracking] 3. No last location");
+      }
+    } catch (e) {
+      console.log("[Location:startTracking] Error fetching last location", e);
       lastLocationRef.current = null;
     }
 
-    // iOS Safari optimized options
     const geoOptions: PositionOptions = {
       enableHighAccuracy: true,
-      maximumAge: isIOSSafari() ? 10000 : 0, // iOS Safari benefits from some caching
-      timeout: isIOSSafari() ? 15000 : 10000, // iOS Safari may need more time
+      maximumAge: isIOSSafari() ? 10000 : 0,
+      timeout: isIOSSafari() ? 15000 : 10000,
+    };
+    console.log("[Location:startTracking] 4. geoOptions", geoOptions);
+
+    const onPosition = (latitude: number, longitude: number) => {
+      setCurrentLocation({ lat: latitude, lng: longitude });
+      const now = Date.now();
+      const shouldSave =
+        lastSaveTimeRef.current === null ||
+        now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
+      if (shouldSave) {
+        lastSaveTimeRef.current = now;
+        saveLocation(latitude, longitude);
+      }
     };
 
-    // Request location permission and get initial position
-    // This must be called directly from user interaction for iOS Safari
+    if (isNativePlatform()) {
+      console.log("[Location:startTracking] 5. Native path: CapGeolocation.getCurrentPosition");
+      try {
+        const position = await CapGeolocation.getCurrentPosition({
+          enableHighAccuracy: true,
+          timeout: 15000,
+          maximumAge: 10000,
+        });
+        const { latitude, longitude } = position.coords;
+        setCurrentLocation({ lat: latitude, lng: longitude });
+        lastSaveTimeRef.current = Date.now();
+        saveLocation(latitude, longitude);
+        setIsTracking(true);
+        setPermissionStatus("granted");
+
+        const watchId = await CapGeolocation.watchPosition(
+          {
+            enableHighAccuracy: true,
+            timeout: 15000,
+            maximumAge: 5000,
+          },
+          (position, err) => {
+            if (err) {
+              console.error("Error watching location:", err);
+              setError("Error tracking location. Please check permissions.");
+              setPermissionStatus("denied");
+              setIsTracking(false);
+              return;
+            }
+            if (position?.coords) {
+              onPosition(position.coords.latitude, position.coords.longitude);
+            }
+          }
+        );
+        watchIdRef.current = watchId;
+        clearRequestTimeout();
+      } catch (err: unknown) {
+        console.log("[Location:startTracking] Native getCurrentPosition error", err);
+        clearRequestTimeout();
+        setIsRequesting(false);
+        setIsTracking(false);
+        const message =
+          err && typeof err === "object" && "message" in err
+            ? String((err as { message: string }).message)
+            : "Unable to get location.";
+        if (message.includes("denied") || message.includes("Permission")) {
+          setPermissionStatus("denied");
+        }
+        setError(
+          message.includes("denied")
+            ? "Location permission was denied. Enable it in Settings > Privacy > Location."
+            : message
+        );
+      } finally {
+        setIsRequesting(false);
+      }
+      return;
+    }
+
+    // Web: use navigator.geolocation
+    console.log("[Location:startTracking] 5. Web path: calling navigator.geolocation.getCurrentPosition", { timeout: geoOptions.timeout });
     navigator.geolocation.getCurrentPosition(
       (position) => {
+        console.log("[Location:startTracking] 6. getCurrentPosition SUCCESS", { lat: position.coords.latitude, lng: position.coords.longitude });
+        clearRequestTimeout();
         const { latitude, longitude } = position.coords;
         setCurrentLocation({ lat: latitude, lng: longitude });
         lastSaveTimeRef.current = Date.now();
@@ -356,7 +665,6 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
         setIsRequesting(false);
         setPermissionStatus("granted");
 
-        // Start watching position changes with iOS-optimized options
         const watchOptions: PositionOptions = {
           enableHighAccuracy: true,
           maximumAge: isIOSSafari() ? 5000 : 0,
@@ -364,41 +672,17 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
         };
 
         watchIdRef.current = navigator.geolocation.watchPosition(
-          (position) => {
-            const { latitude, longitude } = position.coords;
-            setCurrentLocation({ lat: latitude, lng: longitude });
-            const now = Date.now();
-            const shouldSave =
-              lastSaveTimeRef.current === null ||
-              now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
-            if (shouldSave) {
-              lastSaveTimeRef.current = now;
-              saveLocation(latitude, longitude);
-            }
+          (pos) => {
+            const { latitude, longitude } = pos.coords;
+            onPosition(latitude, longitude);
           },
           (error) => {
-            console.error("Error watching location:", error);
-            let errorMessage = "Error tracking location. ";
-            
-            switch (error.code) {
-              case error.PERMISSION_DENIED:
-                errorMessage += "Location permission was denied.";
-                setPermissionStatus("denied");
-                break;
-              case error.POSITION_UNAVAILABLE:
-                errorMessage += "Location information is unavailable.";
-                break;
-              case error.TIMEOUT:
-                errorMessage += "Location request timed out.";
-                break;
-              default:
-                errorMessage += "Please check your permissions.";
-            }
-            
-            setError(errorMessage);
+            console.error("[Location:startTracking] watchPosition error", error);
+            if (error.code === error.PERMISSION_DENIED) setPermissionStatus("denied");
+            setError("Error tracking location.");
             setIsTracking(false);
             if (watchIdRef.current !== null) {
-              navigator.geolocation.clearWatch(watchIdRef.current);
+              navigator.geolocation.clearWatch(watchIdRef.current as number);
               watchIdRef.current = null;
             }
           },
@@ -406,58 +690,56 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
         );
       },
       (error) => {
+        console.log("[Location:startTracking] 6. getCurrentPosition ERROR", { code: error.code, message: error.message, PERMISSION_DENIED: error.PERMISSION_DENIED });
+        clearRequestTimeout();
         setIsRequesting(false);
         setIsTracking(false);
-        
-        let errorMessage = "Unable to get your location. ";
-        switch (error.code) {
-          case error.PERMISSION_DENIED:
-            errorMessage += "Location permission was denied. ";
-            if (isIOSSafari()) {
-              errorMessage += "On iOS, go to Settings > Safari > Location Services and enable location access for this site.";
-            } else {
-              errorMessage += "Please enable location access in your browser settings.";
-            }
-            setPermissionStatus("denied");
-            break;
-          case error.POSITION_UNAVAILABLE:
-            errorMessage += "Location information is unavailable. Please ensure location services are enabled on your device.";
-            break;
-          case error.TIMEOUT:
-            errorMessage += "Location request timed out. Please try again.";
-            break;
-          default:
-            errorMessage += "An unknown error occurred.";
-            break;
+        if (error.code === error.PERMISSION_DENIED) {
+          setPermissionStatus("denied");
+          setError(
+            isIOSSafari()
+              ? "On iOS, go to Settings > Safari > Location Services and enable location access for this site."
+              : "Please enable location access in your browser settings."
+          );
+        } else {
+          setError("Unable to get your location. Please try again.");
         }
-        setError(errorMessage);
       },
       geoOptions
     );
+    console.log("[Location:startTracking] 5b. getCurrentPosition called (waiting for browser callback)");
   }, [user, supabase, saveLocation]);
 
-  const stopTracking = useCallback(() => {
+  const stopTracking = useCallback(async () => {
     setIsTracking(false);
     setError(null);
     if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
+      if (isNativePlatform()) {
+        await CapGeolocation.clearWatch({ id: watchIdRef.current as string });
+      } else {
+        navigator.geolocation.clearWatch(watchIdRef.current as number);
+      }
       watchIdRef.current = null;
     }
-    // Reset refs when stopping tracking
     lastLocationRef.current = null;
     lastSaveTimeRef.current = null;
   }, []);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
+      const id = watchIdRef.current;
+      if (id !== null) {
+        if (isNativePlatform()) {
+          CapGeolocation.clearWatch({ id: id as string }).catch(() => {});
+        } else {
+          navigator.geolocation.clearWatch(id as number);
+        }
       }
     };
   }, []);
 
   const handleToggleTracking = () => {
+    console.log("[Location:button] handleToggleTracking clicked", { isTracking, isRequesting });
     if (isTracking) {
       stopTracking();
     } else {
@@ -795,12 +1077,19 @@ function ClusterPopup({ photos, user }: { photos: Photo[]; user: User | null }) 
               return;
             }
 
-            // If we have storage_path and user, create signed URL and use cache
+            // If we have storage_path and user, check local cache first — only download if we don't have it
             if (photo.storage_path && user) {
               // Security check: Ensure storage_path starts with user ID
               if (!photo.storage_path.startsWith(`${user.id}/`)) {
                 console.error(`Security: Photo ${photo.id} storage_path doesn't match user ID`);
                 setImageUrls((prev) => ({ ...prev, [photo.id]: null }));
+                setLoading((prev) => ({ ...prev, [photo.id]: false }));
+                return;
+              }
+
+              const localUrl = await getCachedImage(photo.id);
+              if (localUrl) {
+                setImageUrls((prev) => ({ ...prev, [photo.id]: localUrl }));
                 setLoading((prev) => ({ ...prev, [photo.id]: false }));
                 return;
               }
@@ -811,7 +1100,6 @@ function ClusterPopup({ photos, user }: { photos: Photo[]; user: User | null }) 
 
               if (error) throw error;
               if (urlData?.signedUrl) {
-                // Use cached image if available, otherwise fetch and cache
                 const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
                 setImageUrls((prev) => ({ ...prev, [photo.id]: cachedUrl }));
               } else {
@@ -935,13 +1223,20 @@ function PhotoPopup({ photo, user }: { photo: Photo; user: User | null }) {
             return;
           }
 
+          // Use local cache first — only create signed URL and download if we don't have it
+          const localUrl = await getCachedImage(photo.id);
+          if (localUrl) {
+            setImageUrl(localUrl);
+            setLoading(false);
+            return;
+          }
+
           const { data: urlData, error } = await supabase.storage
             .from("photos")
             .createSignedUrl(photo.storage_path, 3600);
 
           if (error) throw error;
           if (urlData?.signedUrl) {
-            // Use cached image if available, otherwise fetch and cache
             const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
             setImageUrl(cachedUrl);
           }
@@ -992,23 +1287,36 @@ function MapController({ center, zoom }: { center: [number, number]; zoom?: numb
 }
 
 export default function Map({ user, locations, photos = [], onLocationUpdate, focusLocation }: MapProps) {
+  console.log("[Location:Map] render", { locationsCount: locations.length, firstTimestamp: locations[0]?.timestamp?.slice(0, 19), lastTimestamp: locations[locations.length - 1]?.timestamp?.slice(0, 19) });
+
   const [mapCenter, setMapCenter] = useState<[number, number]>([51.505, -0.09]); // Default to London
   const [zoomLevel, setZoomLevel] = useState<number>(13);
   const [viewportThreshold, setViewportThreshold] = useState<number>(0.0004); // Default threshold
 
   useEffect(() => {
-    if (navigator.geolocation && locations.length === 0) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setMapCenter([position.coords.latitude, position.coords.longitude]);
-        },
-        () => {
-          // Use default center if geolocation fails
-        }
-      );
-    } else if (locations.length > 0) {
+    if (locations.length > 0) {
       const lastLocation = locations[locations.length - 1];
       setMapCenter([lastLocation.lat, lastLocation.lng]);
+      return;
+    }
+    const setCenterFromCurrentPosition = (lat: number, lng: number) => {
+      setMapCenter([lat, lng]);
+    };
+    if (isNativePlatform()) {
+      CapGeolocation.getCurrentPosition({ enableHighAccuracy: true, timeout: 10000 })
+        .then((position) => {
+          setCenterFromCurrentPosition(position.coords.latitude, position.coords.longitude);
+        })
+        .catch(() => {});
+      return;
+    }
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setCenterFromCurrentPosition(position.coords.latitude, position.coords.longitude);
+        },
+        () => {}
+      );
     }
   }, [locations]);
 
@@ -1099,68 +1407,82 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
     return locations.filter((_, index) => !excludedLocations.has(`location-${index}`));
   }, [locations, photoGroups, viewportThreshold]);
 
-  // Create sequential timeline connections between events (photos and locations)
-  const timelineConnections = useMemo(() => {
-    const connections: Array<{ 
-      from: [number, number]; 
-      to: [number, number];
-    }> = [];
-    
-    // Create a combined timeline of all events (photos and locations) sorted by timestamp
+  // Timeline and path: use local cache when data unchanged so we don't recompute every time
+  const timelineData = useMemo(() => {
+    const pathCoordinates: [number, number][] = visibleLocations.map((loc) => [loc.lat, loc.lng]);
+
+    const cacheKey =
+      hashTimelineInput(
+        locations,
+        photos.map((p) => ({
+          id: p.id,
+          timestamp: p.timestamp,
+          latitude: p.latitude,
+          longitude: p.longitude,
+        }))
+      ) +
+      "_" +
+      viewportThreshold +
+      "_" +
+      zoomLevel;
+
+    if (user?.id) {
+      const cached = getTimelineCacheSync(user.id, cacheKey);
+      if (cached) {
+        return { connections: cached.connections, pathCoordinates: cached.pathCoordinates };
+      }
+    }
+
+    const connections: Array<{ from: [number, number]; to: [number, number] }> = [];
     interface TimelineEvent {
       position: [number, number];
       timestamp: number;
-      type: 'photo' | 'location';
+      type: "photo" | "location";
     }
-    
     const events: TimelineEvent[] = [];
-    
-    // Add photo groups to timeline
+
     photoGroups.forEach((group) => {
-      const photoPosition: [number, number] = group.photos.length > 1 
-        ? group.center 
-        : [group.photos[0].latitude, group.photos[0].longitude];
-      
-      // Use the earliest photo timestamp in the group
-      const photoTimestamps = group.photos.map(p => new Date(p.timestamp).getTime());
+      const photoPosition: [number, number] =
+        group.photos.length > 1 ? group.center : [group.photos[0].latitude, group.photos[0].longitude];
+      const photoTimestamps = group.photos.map((p) => new Date(p.timestamp).getTime());
       const earliestPhotoTime = Math.min(...photoTimestamps);
-      
-      events.push({
-        position: photoPosition,
-        timestamp: earliestPhotoTime,
-        type: 'photo',
-      });
+      events.push({ position: photoPosition, timestamp: earliestPhotoTime, type: "photo" });
     });
-    
-    // Add locations to timeline
+
     locations.forEach((location) => {
       events.push({
         position: [location.lat, location.lng],
         timestamp: new Date(location.timestamp).getTime(),
-        type: 'location',
+        type: "location",
       });
     });
-    
-    // Sort events by timestamp
-    events.sort((a, b) => a.timestamp - b.timestamp);
-    
-    // Connect each event to the next event in chronological order
-    for (let i = 0; i < events.length - 1; i++) {
-      connections.push({
-        from: events[i].position,
-        to: events[i + 1].position,
-      });
-    }
-    
-    console.log(`[Timeline] Created ${connections.length} sequential connections from ${events.length} events`);
-    
-    return connections;
-  }, [photoGroups, locations]);
 
-  // Use visibleLocations for path coordinates (calculated after filtering)
-  const pathCoordinates: [number, number][] = useMemo(() => {
-    return visibleLocations.map((loc) => [loc.lat, loc.lng]);
-  }, [visibleLocations]);
+    events.sort((a, b) => a.timestamp - b.timestamp);
+    for (let i = 0; i < events.length - 1; i++) {
+      connections.push({ from: events[i].position, to: events[i + 1].position });
+    }
+
+    if (user?.id) {
+      setTimelineCacheSync(user.id, cacheKey, { connections, pathCoordinates });
+    }
+    return { connections, pathCoordinates };
+  }, [photoGroups, locations, visibleLocations, viewportThreshold, zoomLevel, user?.id, photos]);
+
+  const timelineConnections = timelineData.connections;
+  const pathCoordinates = timelineData.pathCoordinates;
+
+  // Use ALL locations for the breadcrumb trail line so new points always show (visibleLocations
+  // excludes points near photos, which hid new breadcrumbs when near a photo)
+  const pathCoordinatesFull = useMemo(
+    () => locations.map((loc) => [loc.lat, loc.lng] as [number, number]),
+    [locations]
+  );
+
+  console.log("[Location:Map] trail data", {
+    pathCoordinatesCount: pathCoordinates.length,
+    pathCoordinatesFullCount: pathCoordinatesFull.length,
+    timelineConnectionsCount: timelineConnections.length,
+  });
 
   return (
     <div className="w-full h-full relative">
@@ -1178,11 +1500,12 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
         <ZoomTracker onZoomChange={setZoomLevel} />
         <ViewportTracker onThresholdChange={setViewportThreshold} />
         
-        {/* Breadcrumb trail - continuous line connecting all points */}
-        {pathCoordinates.length > 1 && (
-          <Polyline 
-            positions={pathCoordinates} 
-            color="#3b82f6" 
+        {/* Breadcrumb trail - continuous line connecting ALL points (so new locations always appear) */}
+        {pathCoordinatesFull.length > 1 && (
+          <Polyline
+            key={`breadcrumb-${pathCoordinatesFull.length}-${pathCoordinatesFull[pathCoordinatesFull.length - 1]?.join(",")}`}
+            positions={pathCoordinatesFull}
+            color="#3b82f6"
             weight={4}
             opacity={0.8}
             smoothFactor={1}

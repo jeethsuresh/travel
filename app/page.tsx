@@ -1,15 +1,14 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 
-// Force dynamic rendering to prevent build-time Supabase client creation
-export const dynamic = 'force-dynamic';
 import dynamicImport from "next/dynamic";
 import { createClient } from "@/lib/supabase/client";
 import Auth from "@/components/Auth";
 import LocationHistory from "@/components/LocationHistory";
 import PhotoGallery from "@/components/PhotoGallery";
 import type { User } from "@supabase/supabase-js";
+import { getPendingLocationsForUser, getPendingPhotosForUser } from "@/lib/localStore";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
 const Map = dynamicImport(() => import("@/components/Map"), {
@@ -38,6 +37,7 @@ interface PhotoWithLocation {
   longitude: number;
   timestamp: string;
   storage_path: string;
+  url?: string;
 }
 
 export default function Home() {
@@ -46,7 +46,8 @@ export default function Home() {
   const [photos, setPhotos] = useState<PhotoWithLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [focusLocation, setFocusLocation] = useState<{ latitude: number; longitude: number } | null>(null);
-  
+  const pendingPhotoUrlsRef = useRef<globalThis.Map<string, string>>(new globalThis.Map());
+
   // Lazy initialization of Supabase client to avoid issues during build
   const supabase = useMemo(() => {
     if (typeof window === 'undefined') {
@@ -73,22 +74,46 @@ export default function Home() {
   }, [supabase]);
 
   const fetchLocations = useCallback(async () => {
+    console.log("[Location:page] fetchLocations 1. Entry", { hasUser: !!user, hasSupabase: !!supabase });
     if (!user || !supabase) {
+      console.log("[Location:page] fetchLocations 1b. Early return: no user or supabase");
       setLocations([]);
       return;
     }
 
     try {
-      const { data, error } = await supabase
-        .from("locations")
-        .select("*")
-        .eq("user_id", user.id)
-        .order("timestamp", { ascending: true });
+      console.log("[Location:page] fetchLocations 2. Fetching remote + pending");
+      const [remoteResult, pendingList] = await Promise.all([
+        supabase
+          .from("locations")
+          .select("*")
+          .eq("user_id", user.id)
+          .order("timestamp", { ascending: true }),
+        getPendingLocationsForUser(user.id),
+      ]);
 
-      if (error) throw error;
-      setLocations(data || []);
+      if (remoteResult.error) {
+        console.log("[Location:page] fetchLocations 2. Remote error", remoteResult.error);
+        throw remoteResult.error;
+      }
+
+      const remote = remoteResult.data || [];
+      const pendingAsLocations: Location[] = pendingList.map((p) => ({
+        id: p.id,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        timestamp: p.timestamp,
+        wait_time: p.wait_time,
+      }));
+
+      const merged = [...remote, ...pendingAsLocations].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+      console.log("[Location:page] fetchLocations 3. Merged", { remoteCount: remote.length, pendingCount: pendingList.length, mergedCount: merged.length, ids: merged.map((l) => l.id) });
+      setLocations(merged);
+      console.log("[Location:page] fetchLocations 4. setLocations(merged) called");
     } catch (error) {
-      console.error("Error fetching locations:", error);
+      console.error("[Location:page] fetchLocations Error:", error);
     }
   }, [user, supabase]);
 
@@ -99,18 +124,46 @@ export default function Home() {
     }
 
     try {
-      const { data, error } = await supabase
-        .from("photos")
-        .select("id, latitude, longitude, timestamp, storage_path")
-        .eq("user_id", user.id)
-        .not("latitude", "is", null)
-        .not("longitude", "is", null)
-        .order("timestamp", { ascending: false });
+      const [remoteResult, pendingList] = await Promise.all([
+        supabase
+          .from("photos")
+          .select("id, latitude, longitude, timestamp, storage_path")
+          .eq("user_id", user.id)
+          .not("latitude", "is", null)
+          .not("longitude", "is", null)
+          .order("timestamp", { ascending: false }),
+        getPendingPhotosForUser(user.id),
+      ]);
 
-      if (error) throw error;
-      setPhotos((data || []).filter((photo): photo is PhotoWithLocation => 
-        photo.latitude !== null && photo.longitude !== null
-      ));
+      if (remoteResult.error) throw remoteResult.error;
+
+      const remote = (remoteResult.data || []).filter(
+        (photo): photo is PhotoWithLocation =>
+          photo.latitude !== null && photo.longitude !== null
+      );
+
+      pendingPhotoUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      pendingPhotoUrlsRef.current.clear();
+
+      const pendingPhotos: PhotoWithLocation[] = pendingList
+        .filter((p) => p.latitude != null && p.longitude != null)
+        .map((p) => {
+          const url = URL.createObjectURL(p.blob);
+          pendingPhotoUrlsRef.current.set(p.id, url);
+          return {
+            id: p.id,
+            latitude: p.latitude!,
+            longitude: p.longitude!,
+            timestamp: p.timestamp,
+            storage_path: "",
+            url,
+          };
+        });
+
+      const merged = [...pendingPhotos, ...remote].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      setPhotos(merged);
     } catch (error) {
       console.error("Error fetching photos:", error);
     }
@@ -125,6 +178,13 @@ export default function Home() {
       setPhotos([]);
     }
   }, [user, fetchLocations, fetchPhotos]);
+
+  useEffect(() => {
+    return () => {
+      pendingPhotoUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      pendingPhotoUrlsRef.current.clear();
+    };
+  }, []);
 
   if (loading) {
     return (
@@ -166,10 +226,14 @@ export default function Home() {
               <div>
                 <LocationHistory
                   user={user}
+                  locations={locations}
                   onLocationSelect={(location) => {
-                    // Could implement map centering on location select
-                    console.log("Selected location:", location);
+                    setFocusLocation({
+                      latitude: location.latitude,
+                      longitude: location.longitude,
+                    });
                   }}
+                  onRefresh={fetchLocations}
                 />
               </div>
             </div>

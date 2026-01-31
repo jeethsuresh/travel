@@ -1,11 +1,19 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
+import { Capacitor } from "@capacitor/core";
+import { Camera } from "@capacitor/camera";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
 import exifr from "exifr";
 import { compressImage } from "@/lib/imageCompression";
-import { fetchImageWithCache } from "@/lib/imageCache";
+import { getCachedImage, fetchImageWithCache } from "@/lib/imageCache";
+import { isNativePlatform } from "@/lib/capacitor";
+import {
+  addPendingPhoto,
+  getPendingPhotosForUser,
+  deletePendingPhoto,
+} from "@/lib/localStore";
 
 interface Photo {
   id: string;
@@ -36,6 +44,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pendingUrlsRef = useRef<Map<string, string>>(new Map());
   const supabase = createClient();
 
   const fetchPhotos = useCallback(async () => {
@@ -46,57 +55,64 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
     setLoading(true);
     try {
-      const { data, error } = await supabase
-        .from("photos")
-        .select("*")
-        .eq("user_id", user.id)
-        .order("timestamp", { ascending: false });
+      const [remoteResult, pendingList] = await Promise.all([
+        supabase
+          .from("photos")
+          .select("*")
+          .eq("user_id", user.id)
+          .order("timestamp", { ascending: false }),
+        getPendingPhotosForUser(user.id),
+      ]);
 
-      if (error) throw error;
+      if (remoteResult.error) throw remoteResult.error;
+      const data = remoteResult.data || [];
 
-      // Get signed URLs for all photos - with security validation and caching
+      // Revoke previous pending object URLs to avoid leaks
+      pendingUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      pendingUrlsRef.current.clear();
+
       const photosWithUrls = await Promise.all(
-        (data || []).map(async (photo) => {
-          // Security check: Ensure storage_path starts with user ID
+        data.map(async (photo: Photo) => {
           if (!photo.storage_path.startsWith(`${user.id}/`)) {
-            console.error(`Security: Photo ${photo.id} storage_path doesn't match user ID`);
-            return {
-              ...photo,
-              url: null,
-            };
+            return { ...photo, url: undefined };
           }
-
-          // Verify photo belongs to current user (double-check)
           if (photo.user_id !== user.id) {
-            console.error(`Security: Photo ${photo.id} doesn't belong to current user`);
-            return {
-              ...photo,
-              url: null,
-            };
+            return { ...photo, url: undefined };
           }
-
+          // Use local cache first — only create signed URL and download if we don't have it
+          const localUrl = await getCachedImage(photo.id);
+          if (localUrl) {
+            return { ...photo, url: localUrl };
+          }
           const { data: urlData } = await supabase.storage
             .from("photos")
             .createSignedUrl(photo.storage_path, 3600);
-
           if (!urlData?.signedUrl) {
-            return {
-              ...photo,
-              url: null,
-            };
+            return { ...photo, url: undefined };
           }
-
-          // Use cached image if available, otherwise fetch and cache
           const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
-
-          return {
-            ...photo,
-            url: cachedUrl,
-          };
+          return { ...photo, url: cachedUrl };
         })
       );
 
-      setPhotos(photosWithUrls);
+      const pendingPhotos: Photo[] = pendingList.map((p) => {
+        const url = URL.createObjectURL(p.blob);
+        pendingUrlsRef.current.set(p.id, url);
+        return {
+          id: p.id,
+          user_id: p.user_id,
+          storage_path: "",
+          latitude: p.latitude,
+          longitude: p.longitude,
+          timestamp: p.timestamp,
+          url,
+        };
+      });
+
+      const merged = [...pendingPhotos, ...photosWithUrls].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      ) as Photo[];
+      setPhotos(merged);
     } catch (error) {
       console.error("Error fetching photos:", error);
       setError("Failed to load photos");
@@ -180,24 +196,18 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       }
 
       try {
-        // Verify authentication session before proceeding
         const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
-        
         if (authError || !authUser) {
           throw new Error("Authentication failed. Please sign in again.");
         }
-
         if (authUser.id !== user.id) {
           throw new Error("User ID mismatch. Please refresh the page.");
         }
 
-        // Extract EXIF data from the photo (location and date/time)
-        // Only use location from EXIF (where photo was taken), not upload location
-        // Use date/time from EXIF (when photo was taken), not upload time
         let finalLatitude: number | undefined;
         let finalLongitude: number | undefined;
         let photoTimestamp: string | undefined;
-        
+
         const exifData = await extractExifData(file);
         if (exifData.latitude && exifData.longitude) {
           finalLatitude = exifData.latitude;
@@ -207,68 +217,95 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           photoTimestamp = exifData.timestamp;
         }
 
-        if (fileId) {
-          setUploadProgress((prev) => ({ ...prev, [fileId]: 10 }));
-        }
+        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 10 }));
 
-        // Compress image before upload to reduce storage and egress costs
+        // Compress locally first (before storing and uploading)
         const compressedFile = await compressImage(file);
 
-        if (fileId) {
-          setUploadProgress((prev) => ({ ...prev, [fileId]: 30 }));
-        }
+        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 30 }));
 
-        // Generate unique filename (always use .jpg for compressed images)
-        const fileName = `${user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
+        // Store locally first so it appears immediately
+        const pending = await addPendingPhoto({
+          user_id: authUser.id,
+          latitude: finalLatitude ?? null,
+          longitude: finalLongitude ?? null,
+          timestamp: photoTimestamp ?? new Date().toISOString(),
+          blob: compressedFile,
+        });
 
-        // Upload compressed image to Supabase Storage
-        const { error: uploadError } = await supabase.storage
-          .from("photos")
-          .upload(fileName, compressedFile, {
-            cacheControl: "3600",
-            upsert: false,
-          });
+        const localUrl = URL.createObjectURL(compressedFile);
+        pendingUrlsRef.current.set(pending.id, localUrl);
 
-        if (uploadError) {
-          console.error("Storage upload error:", uploadError);
-          throw uploadError;
-        }
+        setPhotos((prev) => [
+          {
+            id: pending.id,
+            user_id: pending.user_id,
+            storage_path: "",
+            latitude: pending.latitude,
+            longitude: pending.longitude,
+            timestamp: pending.timestamp,
+            url: localUrl,
+          },
+          ...prev,
+        ]);
 
-        if (fileId) {
-          setUploadProgress((prev) => ({ ...prev, [fileId]: 70 }));
-        }
+        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 50 }));
 
-        // Save photo metadata to database
-        // Use the authenticated user's ID from the session
-        // Use EXIF timestamp if available, otherwise use current time
-        const insertData: any = {
-          user_id: authUser.id, // Use authUser.id to ensure it matches auth.uid()
-          storage_path: fileName,
-          latitude: finalLatitude || null,
-          longitude: finalLongitude || null,
-        };
-        
-        // Set timestamp from EXIF if available, otherwise let database use default (NOW())
-        if (photoTimestamp) {
-          insertData.timestamp = photoTimestamp;
-        }
-        
-        const { data: insertedPhoto, error: dbError } = await supabase
-          .from("photos")
-          .insert(insertData)
-          .select()
-          .single();
+        onPhotosUpdate?.();
 
-        if (dbError) {
-          console.error("Database insert error:", dbError);
-          console.error("Attempted insert with user_id:", authUser.id);
-          throw dbError;
-        }
+        // Upload to Supabase in background
+        (async () => {
+          try {
+            const fileName = `${authUser.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
+            const { error: uploadError } = await supabase.storage
+              .from("photos")
+              .upload(fileName, compressedFile, {
+                cacheControl: "3600",
+                upsert: false,
+              });
 
-        if (fileId) {
-          setUploadProgress((prev) => ({ ...prev, [fileId]: 100 }));
-        }
-      } catch (error: any) {
+            if (uploadError) throw uploadError;
+
+            if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 70 }));
+
+            const insertData: Record<string, unknown> = {
+              user_id: authUser.id,
+              storage_path: fileName,
+              latitude: finalLatitude ?? null,
+              longitude: finalLongitude ?? null,
+            };
+            if (photoTimestamp) insertData.timestamp = photoTimestamp;
+
+            const { error: dbError } = await supabase
+              .from("photos")
+              .insert(insertData)
+              .select()
+              .single();
+
+            if (dbError) throw dbError;
+
+            if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 100 }));
+
+            const urlToRevoke = pendingUrlsRef.current.get(pending.id);
+            if (urlToRevoke) {
+              URL.revokeObjectURL(urlToRevoke);
+              pendingUrlsRef.current.delete(pending.id);
+            }
+            await deletePendingPhoto(pending.id);
+            await fetchPhotos();
+            onPhotosUpdate?.();
+          } catch (err) {
+            console.error("Background photo upload failed:", err);
+            if (fileId) {
+              setUploadProgress((prev) => {
+                const next = { ...prev };
+                delete next[fileId];
+                return next;
+              });
+            }
+          }
+        })();
+      } catch (error: unknown) {
         console.error("Error uploading photo:", error);
         if (fileId) {
           setUploadProgress((prev) => {
@@ -280,7 +317,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         throw error;
       }
     },
-    [user, supabase, extractExifData]
+    [user, supabase, extractExifData, fetchPhotos, onPhotosUpdate]
   );
 
   const handleFileSelect = useCallback(
@@ -325,6 +362,58 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       }
     },
     [uploadPhoto, fetchPhotos, onPhotosUpdate]
+  );
+
+  /** On native: pick from photo library, compress locally, upload once. No redownloading. */
+  const pickFromNativeLibrary = useCallback(
+    async () => {
+      if (!user) return;
+      setUploading(true);
+      setError(null);
+      try {
+        const result = await Camera.pickImages({
+          limit: 50,
+          quality: 100, // We compress ourselves before upload
+        });
+        if (!result.photos?.length) {
+          setUploading(false);
+          return;
+        }
+        const uploadPromises = result.photos.map(async (photo, index) => {
+          const fileId = `native-${Date.now()}-${index}`;
+          setUploadProgress((prev) => ({ ...prev, [fileId]: 0 }));
+          try {
+            const path = photo.path ?? photo.webPath;
+            if (!path) throw new Error("Photo path missing");
+            const webPath = Capacitor.convertFileSrc(path);
+            const response = await fetch(webPath);
+            if (!response.ok) throw new Error("Failed to read photo");
+            const blob = await response.blob();
+            const file = new File([blob], `photo-${Date.now()}-${index}.jpg`, {
+              type: blob.type || "image/jpeg",
+            });
+            await uploadPhoto(file, undefined, undefined, fileId);
+          } catch (err) {
+            console.error(`Error uploading photo ${index}:`, err);
+            setUploadProgress((prev) => {
+              const next = { ...prev };
+              delete next[fileId];
+              return next;
+            });
+          }
+        });
+        await Promise.all(uploadPromises);
+        await fetchPhotos();
+        if (onPhotosUpdate) onPhotosUpdate();
+        setTimeout(() => setUploadProgress({}), 1000);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Failed to pick photos";
+        setError(message);
+      } finally {
+        setUploading(false);
+      }
+    },
+    [user, uploadPhoto, fetchPhotos, onPhotosUpdate]
   );
 
   const startCamera = useCallback(async () => {
@@ -408,20 +497,38 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       return;
     }
 
-    // Security check: Verify photo belongs to current user
     if (photo.user_id !== user.id) {
       setError("You don't have permission to download this photo");
       return;
     }
 
-    // Security check: Verify storage_path format
+    // Pending (local-only) photo: use existing url (blob URL)
+    const isPending = !photo.storage_path || !photo.storage_path.startsWith(`${user.id}/`);
+    if (isPending && photo.url) {
+      try {
+        const response = await fetch(photo.url);
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `photo-${photo.id}.jpg`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      } catch (e) {
+        setError("Failed to download photo");
+      }
+      return;
+    }
+
     if (!photo.storage_path.startsWith(`${user.id}/`)) {
       setError("Invalid photo path");
       return;
     }
 
-    // Generate a fresh signed URL for download
-    let downloadUrl = photo.url;
+    // Use local cache first — only create signed URL if we don't have it locally
+    let downloadUrl = photo.url ?? (await getCachedImage(photo.id));
     if (!downloadUrl) {
       const { data: urlData, error: urlError } = await supabase.storage
         .from("photos")
@@ -476,49 +583,53 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         return;
       }
 
-      // Security check: Verify photo belongs to current user
       if (photo.user_id !== user.id) {
         setError("You don't have permission to delete this photo");
         return;
       }
 
-      // Security check: Verify storage_path format
-      if (!photo.storage_path.startsWith(`${user.id}/`)) {
-        setError("Invalid photo path");
+      if (!confirm("Are you sure you want to delete this photo?")) return;
+
+      const isPending = !photo.storage_path || !photo.storage_path.startsWith(`${user.id}/`);
+
+      if (isPending) {
+        // Local-only pending photo: remove from local store and UI
+        const urlToRevoke = pendingUrlsRef.current.get(photo.id);
+        if (urlToRevoke) {
+          URL.revokeObjectURL(urlToRevoke);
+          pendingUrlsRef.current.delete(photo.id);
+        }
+        await deletePendingPhoto(photo.id);
+        setPhotos((prev) => prev.filter((p) => p.id !== photo.id));
+        if (onPhotosUpdate) onPhotosUpdate();
         return;
       }
 
-      if (!confirm("Are you sure you want to delete this photo?")) return;
+      if (!isPending) {
+        // Synced photo: delete from storage and database
+        setPhotos((prevPhotos) => prevPhotos.filter((p) => p.id !== photo.id));
 
-      // Optimistically remove from UI
-      setPhotos((prevPhotos) => prevPhotos.filter((p) => p.id !== photo.id));
+        try {
+          const { error: storageError } = await supabase.storage
+            .from("photos")
+            .remove([photo.storage_path]);
 
-      try {
-        // Delete from storage (with path validation)
-        const { error: storageError } = await supabase.storage
-          .from("photos")
-          .remove([photo.storage_path]);
+          if (storageError) throw storageError;
 
-        if (storageError) throw storageError;
+          const { error: dbError } = await supabase
+            .from("photos")
+            .delete()
+            .eq("id", photo.id)
+            .eq("user_id", user.id);
 
-        // Delete from database (with user ID check for extra security)
-        const { error: dbError } = await supabase
-          .from("photos")
-          .delete()
-          .eq("id", photo.id)
-          .eq("user_id", user.id); // Extra security: ensure user owns the photo
+          if (dbError) throw dbError;
 
-        if (dbError) throw dbError;
-
-        // Notify parent component
-        if (onPhotosUpdate) {
-          onPhotosUpdate();
+          if (onPhotosUpdate) onPhotosUpdate();
+        } catch (error) {
+          console.error("Error deleting photo:", error);
+          setError("Failed to delete photo");
+          await fetchPhotos();
         }
-      } catch (error) {
-        console.error("Error deleting photo:", error);
-        setError("Failed to delete photo");
-        // Revert optimistic update on error
-        await fetchPhotos();
       }
     },
     [user, supabase, fetchPhotos, onPhotosUpdate]
@@ -658,13 +769,23 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
               >
                 Select
               </button>
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={uploading}
-                className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
-              >
-                {uploading ? "Uploading..." : "Upload Photos"}
-              </button>
+              {isNativePlatform() ? (
+                <button
+                  onClick={pickFromNativeLibrary}
+                  disabled={uploading}
+                  className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
+                >
+                  {uploading ? "Uploading..." : "Pick from Library"}
+                </button>
+              ) : (
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-md text-sm font-medium disabled:opacity-50"
+                >
+                  {uploading ? "Uploading..." : "Upload Photos"}
+                </button>
+              )}
               <button
                 onClick={showCamera ? stopCamera : startCamera}
                 className="px-4 py-2 bg-green-500 hover:bg-green-600 text-white rounded-md text-sm font-medium"

@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
+import { getPendingLocationsForUser } from "@/lib/localStore";
 
 interface Location {
   id: string;
@@ -14,34 +15,56 @@ interface Location {
 
 interface LocationHistoryProps {
   user: User | null;
+  /** When provided, this list is shown (e.g. from parent so new locations appear without refetch). */
+  locations?: Location[] | null;
   onLocationSelect?: (location: Location) => void;
+  /** Callback to refetch locations (e.g. for Refresh button). */
+  onRefresh?: () => void;
 }
 
 export default function LocationHistory({
   user,
+  locations: locationsProp,
   onLocationSelect,
+  onRefresh,
 }: LocationHistoryProps) {
-  const [locations, setLocations] = useState<Location[]>([]);
+  const [locationsState, setLocationsState] = useState<Location[]>([]);
   const [loading, setLoading] = useState(true);
   const supabase = createClient();
 
   const fetchLocations = useCallback(async () => {
     if (!user) {
-      setLocations([]);
+      setLocationsState([]);
       setLoading(false);
       return;
     }
 
     try {
-      const { data, error } = await supabase
-        .from("locations")
-        .select("*")
-        .eq("user_id", user.id)
-        .order("timestamp", { ascending: false })
-        .limit(100);
+      const [remoteResult, pendingList] = await Promise.all([
+        supabase
+          .from("locations")
+          .select("*")
+          .eq("user_id", user.id)
+          .order("timestamp", { ascending: false })
+          .limit(100),
+        getPendingLocationsForUser(user.id),
+      ]);
 
-      if (error) throw error;
-      setLocations(data || []);
+      if (remoteResult.error) throw remoteResult.error;
+
+      const remote = remoteResult.data || [];
+      const pendingAsLocations: Location[] = pendingList.map((p) => ({
+        id: p.id,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        timestamp: p.timestamp,
+        wait_time: p.wait_time,
+      }));
+
+      const merged = [...remote, ...pendingAsLocations].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      setLocationsState(merged.slice(0, 100));
     } catch (error) {
       console.error("Error fetching locations:", error);
     } finally {
@@ -50,8 +73,29 @@ export default function LocationHistory({
   }, [user, supabase]);
 
   useEffect(() => {
+    if (locationsProp != null) {
+      console.log("[Location:LocationHistory] useEffect: using locations from parent", { count: locationsProp.length });
+      setLoading(false);
+      return;
+    }
+    console.log("[Location:LocationHistory] useEffect: fetching own locations");
     fetchLocations();
-  }, [fetchLocations]);
+  }, [fetchLocations, locationsProp != null]);
+
+  // Use parent's list when provided so new locations show immediately; otherwise use our fetched list
+  const locations =
+    locationsProp != null
+      ? [...locationsProp].sort(
+          (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+        ).slice(0, 100)
+      : locationsState;
+
+  console.log("[Location:LocationHistory] render", {
+    locationsPropNull: locationsProp == null,
+    locationsPropLength: locationsProp?.length ?? "n/a",
+    locationsStateLength: locationsState.length,
+    displayedLocationsLength: locations.length,
+  });
 
   const formatDate = (timestamp: string) => {
     const date = new Date(timestamp);
@@ -98,7 +142,7 @@ export default function LocationHistory({
           Location History
         </h2>
         <button
-          onClick={fetchLocations}
+          onClick={onRefresh ?? fetchLocations}
           className="px-3 py-1 text-sm bg-blue-500 text-white rounded-md hover:bg-blue-600 transition-colors"
         >
           Refresh
