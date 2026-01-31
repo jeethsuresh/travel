@@ -542,9 +542,21 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
     }
 
     try {
-      // Fetch the image
       const response = await fetch(downloadUrl);
-      const blob = await response.blob();
+      if (!response.ok) {
+        setError("Failed to download photo");
+        return;
+      }
+      let blob: Blob;
+      try {
+        const arrayBuffer = await response.arrayBuffer();
+        const contentType = response.headers.get("content-type") || "image/jpeg";
+        blob = new Blob([arrayBuffer], { type: contentType });
+      } catch (bodyError) {
+        console.warn("Download body read failed (e.g. Content-Length mismatch):", (bodyError as Error)?.message);
+        setError("Failed to download photo (network error)");
+        return;
+      }
 
       // Create a temporary URL
       const url = window.URL.createObjectURL(blob);

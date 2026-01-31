@@ -1,3 +1,4 @@
+/// <reference types="@capacitor/background-runner" />
 import type { CapacitorConfig } from "@capacitor/cli";
 
 const config: CapacitorConfig = {
@@ -9,6 +10,16 @@ const config: CapacitorConfig = {
   },
   ios: {
     scheme: "Travel",
+  },
+  plugins: {
+    BackgroundRunner: {
+      label: "com.travel.app.uploadLocations",
+      src: "runners/background.js",
+      event: "uploadPendingLocations",
+      repeat: true,
+      interval: 5,
+      autoStart: true,
+    },
   },
 };
 

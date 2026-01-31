@@ -8,7 +8,10 @@ import Auth from "@/components/Auth";
 import LocationHistory from "@/components/LocationHistory";
 import PhotoGallery from "@/components/PhotoGallery";
 import type { User } from "@supabase/supabase-js";
-import { getPendingLocationsForUser, getPendingPhotosForUser } from "@/lib/localStore";
+import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocation } from "@/lib/localStore";
+import { Preferences } from "@capacitor/preferences";
+import { App } from "@capacitor/app";
+import { isNativePlatform } from "@/lib/capacitor";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
 const Map = dynamicImport(() => import("@/components/Map"), {
@@ -116,6 +119,88 @@ export default function Home() {
       console.error("[Location:page] fetchLocations Error:", error);
     }
   }, [user, supabase]);
+
+  // Sync pending locations to Supabase (upload then remove from local). Used by 5-min background interval.
+  const syncPendingLocationsToSupabase = useCallback(async () => {
+    if (!user || !supabase) return;
+    try {
+      const pending = await getPendingLocationsForUser(user.id);
+      if (pending.length === 0) return;
+      const { data: { user: authUser } } = await supabase.auth.getUser();
+      if (!authUser || authUser.id !== user.id) return;
+      for (const loc of pending) {
+        const { error } = await supabase
+          .from("locations")
+          .insert({
+            user_id: loc.user_id,
+            latitude: loc.latitude,
+            longitude: loc.longitude,
+            timestamp: loc.timestamp,
+            wait_time: loc.wait_time,
+          });
+        if (!error) await deletePendingLocation(loc.id);
+      }
+      fetchLocations();
+    } catch (e) {
+      console.warn("[Location:sync] Background sync failed", e);
+    }
+  }, [user, supabase, fetchLocations]);
+
+  // Upload pending locations in the background every 5 minutes
+  useEffect(() => {
+    if (!user || !supabase) return;
+    const intervalMs = 5 * 60 * 1000;
+    const id = setInterval(syncPendingLocationsToSupabase, intervalMs);
+    return () => clearInterval(id);
+  }, [user, supabase, syncPendingLocationsToSupabase]);
+
+  // Sync pending + auth to Preferences so Background Runner can upload when OS runs the task (iOS/Android)
+  const syncPendingToPreferencesForRunner = useCallback(async () => {
+    if (!isNativePlatform() || !user || !supabase) return;
+    try {
+      const pending = await getPendingLocationsForUser(user.id);
+      const { data: { session } } = await supabase.auth.getSession();
+      if (pending.length > 0 && session?.access_token) {
+        await Preferences.set({
+          key: "travel.pending",
+          value: JSON.stringify(pending),
+        });
+        await Preferences.set({
+          key: "travel.supabaseAuth",
+          value: JSON.stringify({
+            url: process.env.NEXT_PUBLIC_SUPABASE_URL,
+            anonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+            accessToken: session.access_token,
+          }),
+        });
+      }
+    } catch (e) {
+      console.warn("[Location:Preferences] sync for runner failed", e);
+    }
+  }, [user, supabase]);
+
+  // On app background: write pending to Preferences for Background Runner. On app active: apply uploadedIds from runner.
+  useEffect(() => {
+    if (!isNativePlatform()) return;
+    const listenerPromise = App.addListener("appStateChange", async (state) => {
+      if (state.isActive) {
+        try {
+          const { value } = await Preferences.get({ key: "travel.uploadedIds" });
+          if (value) {
+            const ids = JSON.parse(value) as string[];
+            for (const id of ids) await deletePendingLocation(id);
+            await Preferences.remove({ key: "travel.uploadedIds" });
+            fetchLocations();
+          }
+        } catch (e) {
+          console.warn("[Location:uploadedIds] apply failed", e);
+        }
+      } else {
+        await syncPendingToPreferencesForRunner();
+      }
+    });
+    return () => { listenerPromise.then((l) => l.remove()).catch(() => {}); };
+  }, [syncPendingToPreferencesForRunner, fetchLocations]);
 
   const fetchPhotos = useCallback(async () => {
     if (!user || !supabase) {

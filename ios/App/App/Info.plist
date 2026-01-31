@@ -26,8 +26,18 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Travel uses the camera to take photos for your travel map.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.travel.app.uploadLocations</string>
+	</array>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Travel uses your location to record your travel path and show it on the map.</string>
+	<string>Travel records your location in the background so your travel path is saved even when the app is closed or in the background. Choose &quot;Always&quot; for continuous tracking.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Travel uses your location to record your travel path and show it on the map.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
@@ -55,6 +65,8 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>Test Location always</string>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
 </dict>
