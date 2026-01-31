@@ -4,6 +4,8 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
 import exifr from "exifr";
+import { compressImage } from "@/lib/imageCompression";
+import { fetchImageWithCache } from "@/lib/imageCache";
 
 interface Photo {
   id: string;
@@ -52,7 +54,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
       if (error) throw error;
 
-      // Get signed URLs for all photos - with security validation
+      // Get signed URLs for all photos - with security validation and caching
       const photosWithUrls = await Promise.all(
         (data || []).map(async (photo) => {
           // Security check: Ensure storage_path starts with user ID
@@ -77,9 +79,19 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
             .from("photos")
             .createSignedUrl(photo.storage_path, 3600);
 
+          if (!urlData?.signedUrl) {
+            return {
+              ...photo,
+              url: null,
+            };
+          }
+
+          // Use cached image if available, otherwise fetch and cache
+          const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
+
           return {
             ...photo,
-            url: urlData?.signedUrl || null,
+            url: cachedUrl,
           };
         })
       );
@@ -195,18 +207,24 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           photoTimestamp = exifData.timestamp;
         }
 
-        // Generate unique filename
-        const fileExt = file.name.split(".").pop();
-        const fileName = `${user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
+        if (fileId) {
+          setUploadProgress((prev) => ({ ...prev, [fileId]: 10 }));
+        }
+
+        // Compress image before upload to reduce storage and egress costs
+        const compressedFile = await compressImage(file);
 
         if (fileId) {
           setUploadProgress((prev) => ({ ...prev, [fileId]: 30 }));
         }
 
-        // Upload to Supabase Storage
+        // Generate unique filename (always use .jpg for compressed images)
+        const fileName = `${user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
+
+        // Upload compressed image to Supabase Storage
         const { error: uploadError } = await supabase.storage
           .from("photos")
-          .upload(fileName, file, {
+          .upload(fileName, compressedFile, {
             cacheControl: "3600",
             upsert: false,
           });
@@ -366,6 +384,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
       try {
         // Location will be extracted from EXIF data if available
+        // Note: Camera capture already creates JPEG, but compression will still optimize it
         await uploadPhoto(file, undefined, undefined);
         // Refresh photos list after upload
         await fetchPhotos();

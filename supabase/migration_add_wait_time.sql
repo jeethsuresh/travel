@@ -73,3 +73,5 @@
         AND policyname = 'Users can update their own locations'
     ) as update_policy_exists;
 
+
+

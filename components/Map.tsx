@@ -6,6 +6,7 @@ import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
+import { fetchImageWithCache } from "@/lib/imageCache";
 
 // Fix for default marker icons in Next.js - only run on client
 if (typeof window !== "undefined") {
@@ -190,6 +191,8 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
   const [permissionStatus, setPermissionStatus] = useState<PermissionState | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const lastLocationRef = useRef<{ lat: number; lng: number; id: string; timestamp: string } | null>(null);
+  const lastSaveTimeRef = useRef<number | null>(null);
+  const TRACKING_INTERVAL_MS = 5 * 60 * 1000; // Save location at most once every 5 minutes
   const supabase = createClient();
 
   // Check permission status on mount
@@ -347,6 +350,7 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
       (position) => {
         const { latitude, longitude } = position.coords;
         setCurrentLocation({ lat: latitude, lng: longitude });
+        lastSaveTimeRef.current = Date.now();
         saveLocation(latitude, longitude);
         setIsTracking(true);
         setIsRequesting(false);
@@ -363,7 +367,14 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
           (position) => {
             const { latitude, longitude } = position.coords;
             setCurrentLocation({ lat: latitude, lng: longitude });
-            saveLocation(latitude, longitude);
+            const now = Date.now();
+            const shouldSave =
+              lastSaveTimeRef.current === null ||
+              now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
+            if (shouldSave) {
+              lastSaveTimeRef.current = now;
+              saveLocation(latitude, longitude);
+            }
           },
           (error) => {
             console.error("Error watching location:", error);
@@ -432,8 +443,9 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
-    // Reset last location ref when stopping tracking
+    // Reset refs when stopping tracking
     lastLocationRef.current = null;
+    lastSaveTimeRef.current = null;
   }, []);
 
   // Cleanup on unmount
@@ -783,7 +795,7 @@ function ClusterPopup({ photos, user }: { photos: Photo[]; user: User | null }) 
               return;
             }
 
-            // If we have storage_path and user, create signed URL
+            // If we have storage_path and user, create signed URL and use cache
             if (photo.storage_path && user) {
               // Security check: Ensure storage_path starts with user ID
               if (!photo.storage_path.startsWith(`${user.id}/`)) {
@@ -798,7 +810,13 @@ function ClusterPopup({ photos, user }: { photos: Photo[]; user: User | null }) 
                 .createSignedUrl(photo.storage_path, 3600);
 
               if (error) throw error;
-              setImageUrls((prev) => ({ ...prev, [photo.id]: urlData?.signedUrl || null }));
+              if (urlData?.signedUrl) {
+                // Use cached image if available, otherwise fetch and cache
+                const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
+                setImageUrls((prev) => ({ ...prev, [photo.id]: cachedUrl }));
+              } else {
+                setImageUrls((prev) => ({ ...prev, [photo.id]: null }));
+              }
             } else {
               // No storage_path or user, mark as failed
               setImageUrls((prev) => ({ ...prev, [photo.id]: null }));
@@ -923,7 +941,9 @@ function PhotoPopup({ photo, user }: { photo: Photo; user: User | null }) {
 
           if (error) throw error;
           if (urlData?.signedUrl) {
-            setImageUrl(urlData.signedUrl);
+            // Use cached image if available, otherwise fetch and cache
+            const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
+            setImageUrl(cachedUrl);
           }
         } catch (error) {
           console.error("Error loading photo URL:", error);
