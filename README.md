@@ -90,6 +90,48 @@ npm run build
 npm start
 ```
 
+## Native iOS App (Capacitor)
+
+The app can run as a native iOS app using Capacitor, with native geolocation and photo library access. Photos are picked from the device library, compressed locally, and uploaded once to Supabase for storage and web viewing (no redownloading on each open).
+
+### Build and run on iOS
+
+1. **Build the web app for native** (static export):
+
+   ```bash
+   IS_NATIVE=1 npm run build
+   ```
+
+   Or use the script:
+
+   ```bash
+   npm run build:native
+   ```
+
+2. **Sync to iOS** (copies `out` into the native project):
+
+   ```bash
+   npx cap sync ios
+   ```
+
+3. **Open in Xcode and run** on a simulator or device:
+
+   ```bash
+   npx cap open ios
+   ```
+
+   In Xcode, select your target device and press Run (⌘R). For a real device, set your Team under Signing & Capabilities.
+
+### What’s different on native
+
+- **Geolocation**: Uses `@capacitor/geolocation` for iOS location permissions and tracking.
+- **Photos**: On iOS, “Pick from Library” uses the native photo picker (`Camera.pickImages`). Selected images are read from the device, compressed locally, then uploaded once to Supabase. The existing cache still applies so images aren’t re-downloaded unnecessarily.
+
+### Requirements
+
+- macOS with Xcode 15+
+- Apple Developer account for running on a physical device
+
 ## PWA Installation
 
 The app is configured as a Progressive Web App. To install:

@@ -4,6 +4,11 @@ import withPWA from "next-pwa";
 const nextConfig: NextConfig = {
   /* config options here */
   turbopack: {},
+  // Static export for Capacitor iOS (use: npm run build:native)
+  ...(process.env.IS_NATIVE === "1" && {
+    output: "export",
+    images: { unoptimized: true },
+  }),
 };
 
 const pwaConfig = withPWA({

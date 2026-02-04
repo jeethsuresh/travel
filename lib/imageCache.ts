@@ -153,17 +153,31 @@ export async function fetchImageWithCache(
       throw new Error(`Failed to fetch image: ${response.statusText}`);
     }
 
-    const blob = await response.blob();
-    
+    // Use arrayBuffer() then Blob instead of response.blob() to avoid
+    // "Content-Length header exceeds response Body" when the stream is truncated (CDN/network).
+    let blob: Blob;
+    try {
+      const arrayBuffer = await response.arrayBuffer();
+      const contentType = response.headers.get("content-type") || "image/jpeg";
+      blob = new Blob([arrayBuffer], { type: contentType });
+    } catch (bodyError) {
+      console.warn("Image body read failed (e.g. Content-Length mismatch), using signed URL:", (bodyError as Error)?.message ?? bodyError);
+      return signedUrl;
+    }
+
+    if (blob.size === 0) {
+      console.warn("Empty image blob, using signed URL directly");
+      return signedUrl;
+    }
+
     // Cache the blob
     await cacheImage(photoId, blob, signedUrl);
-    
+
     // Return the cached blob URL
     const cachedUrl = await getCachedImage(photoId);
     return cachedUrl || signedUrl;
   } catch (error) {
-    console.error('Error fetching image:', error);
-    // Fallback to signed URL if fetch fails
+    console.warn("Error fetching image, using signed URL:", (error as Error)?.message ?? error);
     return signedUrl;
   }
 }
