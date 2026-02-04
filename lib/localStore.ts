@@ -154,8 +154,8 @@ export async function getPendingLocationsForUser(userId: string): Promise<Pendin
     };
     tx.onerror = () => {
       db.close();
-      console.log("[Location:localStore] getPendingLocationsForUser error", tx.error);
-      reject(tx.error);
+      console.warn("[Location:localStore] getPendingLocationsForUser error; treating as empty list", tx.error ?? "Unknown IndexedDB error");
+      resolve([]);
     };
   });
 }

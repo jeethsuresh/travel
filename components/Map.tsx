@@ -436,18 +436,25 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
           maximumAge: isIOSSafari() ? 5000 : 0,
           timeout: isIOSSafari() ? 15000 : 10000,
         };
-        const callbackId = await Geolocation.watchPosition(watchOptions, (position, err) => {
-          if (err) {
-            console.error("Error watching location (native):", err);
-            setError("Error tracking location. Please check permissions.");
-            setIsTracking(false);
-            clearWatchRef();
-            return;
+        const callbackId = await Geolocation.watchPosition(
+          watchOptions,
+          (position, err) => {
+            if (err) {
+              console.error("Error watching location (native):", err);
+              setError("Error tracking location. Please check permissions.");
+              setIsTracking(false);
+              clearWatchRef();
+              return;
+            }
+            if (position?.coords) {
+              console.log("[Location:bg] native watchPosition update", {
+                lat: position.coords.latitude,
+                lng: position.coords.longitude,
+              });
+              onPosition(position.coords.latitude, position.coords.longitude);
+            }
           }
-          if (position?.coords) {
-            onPosition(position.coords.latitude, position.coords.longitude);
-          }
-        });
+        );
         watchIdRef.current = callbackId;
       } catch (err) {
         setIsRequesting(false);
@@ -478,6 +485,7 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
         watchIdRef.current = navigator.geolocation.watchPosition(
           (pos) => {
             const { latitude, longitude } = pos.coords;
+            console.log("[Location:bg] web watchPosition update", { lat: latitude, lng: longitude });
             onPosition(latitude, longitude);
           },
           (error) => {

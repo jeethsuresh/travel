@@ -16,8 +16,8 @@ const config: CapacitorConfig = {
       label: "com.jeethtravel.app.uploadLocations",
       src: "runners/background.js",
       event: "uploadPendingLocations",
-      repeat: true, // reschedule 5 min after each run
-      interval: 5, // minutes between runs (earliestBeginDate)
+      repeat: true, // reschedule after each run
+      interval: 1, // minutes between runs (earliestBeginDate; iOS may run less often)
       autoStart: true,
     },
   },
