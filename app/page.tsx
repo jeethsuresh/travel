@@ -11,6 +11,7 @@ import type { User } from "@supabase/supabase-js";
 import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocation } from "@/lib/localStore";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
+import { BackgroundRunner } from "@capacitor/background-runner";
 import { isNativePlatform } from "@/lib/capacitor";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
@@ -129,6 +130,18 @@ export default function Home() {
       const { data: { user: authUser } } = await supabase.auth.getUser();
       if (!authUser || authUser.id !== user.id) return;
       for (const loc of pending) {
+        // Include time since last update so wait_time reflects total time at this place (even if no location updates in background)
+        const storedWait = loc.wait_time ?? 0;
+        const elapsedSinceUpdate = Math.max(0, Math.floor((Date.now() - new Date(loc.timestamp).getTime()) / 1000));
+        const effectiveWaitTime = storedWait + elapsedSinceUpdate;
+        const isWaitTimeTopUp = elapsedSinceUpdate > 0;
+        console.log(
+          isWaitTimeTopUp
+            ? "[Location:sync] uploading location with wait_time top-up"
+            : "[Location:sync] uploading new location",
+          { id: loc.id, effectiveWaitTime, elapsedSinceUpdate, storedWait }
+        );
+
         const { error } = await supabase
           .from("locations")
           .insert({
@@ -136,7 +149,7 @@ export default function Home() {
             latitude: loc.latitude,
             longitude: loc.longitude,
             timestamp: loc.timestamp,
-            wait_time: loc.wait_time,
+            wait_time: effectiveWaitTime,
           });
         if (!error) await deletePendingLocation(loc.id);
       }
@@ -154,7 +167,9 @@ export default function Home() {
     return () => clearInterval(id);
   }, [user, supabase, syncPendingLocationsToSupabase]);
 
-  // Sync pending + auth to Preferences so Background Runner can upload when OS runs the task (iOS/Android)
+  // Sync pending + auth to Preferences so Background Runner can upload when OS runs the task (iOS/Android).
+  // Must run while app is in foreground: when we only sync on background, iOS often suspends before the
+  // async write completes, so the runner finds nothing. We sync proactively so data is there when the runner runs.
   const syncPendingToPreferencesForRunner = useCallback(async () => {
     if (!isNativePlatform() || !user || !supabase) return;
     try {
@@ -162,45 +177,76 @@ export default function Home() {
       const { data: { session } } = await supabase.auth.getSession();
       if (pending.length > 0 && session?.access_token) {
         await Preferences.set({
-          key: "travel.pending",
+          key: "jeethtravel.pending",
           value: JSON.stringify(pending),
         });
         await Preferences.set({
-          key: "travel.supabaseAuth",
+          key: "jeethtravel.supabaseAuth",
           value: JSON.stringify({
             url: process.env.NEXT_PUBLIC_SUPABASE_URL,
             anonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
             accessToken: session.access_token,
           }),
         });
+        console.log("[Location:Preferences] synced pending to Preferences for runner", { count: pending.length });
       }
     } catch (e) {
       console.warn("[Location:Preferences] sync for runner failed", e);
     }
   }, [user, supabase]);
 
-  // On app background: write pending to Preferences for Background Runner. On app active: apply uploadedIds from runner.
+  // Proactive sync: write pending to Preferences every 15s while in foreground so Background Runner has data
+  // when iOS runs it (we can't rely on syncing only when backgrounding—iOS may suspend before async completes).
+  useEffect(() => {
+    if (!isNativePlatform() || !user || !supabase) return;
+    const intervalMs = 15 * 1000;
+    const id = setInterval(syncPendingToPreferencesForRunner, intervalMs);
+    syncPendingToPreferencesForRunner(); // run once immediately
+    return () => clearInterval(id);
+  }, [user, supabase, syncPendingToPreferencesForRunner]);
+
+  // On app background: one more sync (best effort). On app active: apply uploadedIds from runner.
   useEffect(() => {
     if (!isNativePlatform()) return;
     const listenerPromise = App.addListener("appStateChange", async (state) => {
       if (state.isActive) {
         try {
-          const { value } = await Preferences.get({ key: "travel.uploadedIds" });
+          const { value } = await Preferences.get({ key: "jeethtravel.uploadedIds" });
           if (value) {
             const ids = JSON.parse(value) as string[];
+            console.log("[Location:uploadedIds] applying from runner", { count: ids.length });
             for (const id of ids) await deletePendingLocation(id);
-            await Preferences.remove({ key: "travel.uploadedIds" });
+            await Preferences.remove({ key: "jeethtravel.uploadedIds" });
             fetchLocations();
           }
         } catch (e) {
           console.warn("[Location:uploadedIds] apply failed", e);
         }
       } else {
+        console.log("[Location:Preferences] app backgrounded, syncing pending for runner");
         await syncPendingToPreferencesForRunner();
       }
     });
     return () => { listenerPromise.then((l) => l.remove()).catch(() => {}); };
   }, [syncPendingToPreferencesForRunner, fetchLocations]);
+
+  const RUNNER_LABEL = "com.jeethtravel.app.uploadLocations";
+  const testBackgroundUpload = useCallback(async () => {
+    if (!isNativePlatform() || !user) return;
+    try {
+      console.log("[Location:test] Syncing pending to Preferences, then dispatching runner…");
+      await syncPendingToPreferencesForRunner();
+      await BackgroundRunner.dispatchEvent({
+        label: RUNNER_LABEL,
+        event: "uploadPendingLocations",
+        details: {},
+      });
+      console.log("[Location:test] Runner finished");
+      fetchLocations();
+    } catch (e) {
+      console.error("[Location:test] Runner failed", e);
+    }
+  }, [user, syncPendingToPreferencesForRunner, fetchLocations]);
 
   const fetchPhotos = useCallback(async () => {
     if (!user || !supabase) {
@@ -292,6 +338,20 @@ export default function Home() {
 
         {user && (
           <>
+            {isNativePlatform() && (
+              <div className="mb-4 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+                <button
+                  type="button"
+                  onClick={testBackgroundUpload}
+                  className="text-sm px-3 py-1.5 rounded bg-amber-500 text-white hover:bg-amber-600"
+                >
+                  Test background upload
+                </button>
+                <p className="text-xs text-amber-800 dark:text-amber-200 mt-2">
+                  Runs the same code iOS runs in background (check Xcode/console for [BackgroundAppRefresh] logs). Real background uploads run only on a physical device, usually 5–15+ minutes after you leave the app; iOS decides when. Enable Settings → General → Background App Refresh for this app.
+                </p>
+              </div>
+            )}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
               <div className="lg:col-span-2">
                 <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-md overflow-hidden" style={{ height: "600px" }}>
@@ -305,6 +365,7 @@ export default function Home() {
                     photos={photos}
                     onLocationUpdate={fetchLocations}
                     focusLocation={focusLocation}
+                    onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
                   />
                 </div>
               </div>

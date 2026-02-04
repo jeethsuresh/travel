@@ -7,6 +7,13 @@ import L from "leaflet";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
 import { fetchImageWithCache } from "@/lib/imageCache";
+import {
+  addPendingLocation,
+  updatePendingLocation,
+  getPendingLocationsForUser,
+} from "@/lib/localStore";
+import { Geolocation } from "@capacitor/geolocation";
+import { isNativePlatform } from "@/lib/capacitor";
 
 // Fix for default marker icons in Next.js - only run on client
 if (typeof window !== "undefined") {
@@ -95,6 +102,8 @@ interface MapProps {
   photos?: Photo[];
   onLocationUpdate: () => void;
   focusLocation?: { latitude: number; longitude: number } | null;
+  /** Called when pending locations change so the page can sync to Preferences for the background runner */
+  onPendingLocationsChange?: () => void;
 }
 
 // Detect iOS Safari
@@ -107,17 +116,18 @@ const isIOSSafari = () => {
   return iOS && webkit && !chrome;
 };
 
-// Check geolocation permission status
+// Check geolocation permission status (native uses Capacitor Geolocation)
 const checkPermissionStatus = async (): Promise<PermissionState | null> => {
-  if (typeof navigator === "undefined" || !navigator.permissions) {
-    return null;
-  }
-  
+  if (typeof window === "undefined") return null;
   try {
+    if (isNativePlatform()) {
+      const { location } = await Geolocation.checkPermissions();
+      return location === "granted" ? "granted" : location === "denied" ? "denied" : null;
+    }
+    if (!navigator.permissions) return null;
     const result = await navigator.permissions.query({ name: "geolocation" as PermissionName });
     return result.state;
-  } catch (error) {
-    // Permissions API might not be supported or geolocation might not be queryable
+  } catch {
     return null;
   }
 };
@@ -183,14 +193,22 @@ const getClusterThreshold = (zoom: number): number => {
   }
 };
 
-function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLocationUpdate: () => void }) {
+function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: { user: User | null; onLocationUpdate: () => void; onPendingLocationsChange?: () => void }) {
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [isTracking, setIsTracking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isRequesting, setIsRequesting] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<PermissionState | null>(null);
-  const watchIdRef = useRef<number | null>(null);
-  const lastLocationRef = useRef<{ lat: number; lng: number; id: string; timestamp: string } | null>(null);
+  // number = navigator.geolocation watch ID; string = Capacitor Geolocation callback ID
+  const watchIdRef = useRef<number | string | null>(null);
+  const lastLocationRef = useRef<{
+    lat: number;
+    lng: number;
+    id: string;
+    timestamp: string;
+    isLocal?: boolean;
+    wait_time?: number;
+  } | null>(null);
   const lastSaveTimeRef = useRef<number | null>(null);
   const TRACKING_INTERVAL_MS = 5 * 60 * 1000; // Save location at most once every 5 minutes
   const supabase = createClient();
@@ -205,11 +223,13 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
   const saveLocation = useCallback(async (lat: number, lng: number) => {
     if (!user) return;
 
+    console.log("[Location:update] saveLocation called", { lat, lng });
+
     try {
       const now = new Date();
       const nowISO = now.toISOString();
 
-      // Check if we have a last location and if it's close enough
+      // Check if we have a last location and if it's close enough (update wait_time)
       if (lastLocationRef.current) {
         const distance = calculateDistance(
           lastLocationRef.current.lat,
@@ -218,12 +238,34 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
           lng
         );
 
-        // If within proximity threshold, update wait_time instead of creating new entry
         if (distance < PROXIMITY_THRESHOLD) {
           const lastTimestamp = new Date(lastLocationRef.current.timestamp);
           const timeDiff = Math.floor((now.getTime() - lastTimestamp.getTime()) / 1000); // seconds
 
-          // Fetch current wait_time and update it
+          // Last location is in IndexedDB (pending): update wait_time locally for next sync/Background App Refresh
+          if (lastLocationRef.current.isLocal) {
+            const newWaitTime = (lastLocationRef.current.wait_time ?? 0) + timeDiff;
+            console.log("[Location:update] updating pending wait_time", { id: lastLocationRef.current.id, timeDiff, newWaitTime });
+            await updatePendingLocation(lastLocationRef.current.id, {
+              wait_time: newWaitTime,
+              timestamp: nowISO,
+              latitude: lat,
+              longitude: lng,
+            });
+            lastLocationRef.current = {
+              ...lastLocationRef.current,
+              lat,
+              lng,
+              timestamp: nowISO,
+              wait_time: newWaitTime,
+            };
+            onPendingLocationsChange?.();
+            onLocationUpdate();
+            return;
+          }
+
+          // Last location is on server: update remotely (one-off; new points will be IndexedDB-first)
+          console.log("[Location:update] updating remote wait_time", { id: lastLocationRef.current.id, timeDiff });
           const { data: currentLocation, error: fetchError } = await supabase
             .from("locations")
             .select("wait_time")
@@ -234,19 +276,17 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
 
           const newWaitTime = (currentLocation?.wait_time || 0) + timeDiff;
 
-          // Update the existing location with new wait_time and timestamp
           const { error: updateError } = await supabase
             .from("locations")
             .update({
               wait_time: newWaitTime,
-              timestamp: nowISO, // Update timestamp to reflect last update
+              timestamp: nowISO,
             })
             .eq("id", lastLocationRef.current.id)
             .eq("user_id", user.id);
 
           if (updateError) throw updateError;
 
-          // Update the ref with new timestamp
           lastLocationRef.current = {
             ...lastLocationRef.current,
             lat,
@@ -259,36 +299,29 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
         }
       }
 
-      // If not close to last location, create a new entry
-      const { data: newLocation, error: insertError } = await supabase
-        .from("locations")
-        .insert({
-          user_id: user.id,
-          latitude: lat,
-          longitude: lng,
-          timestamp: nowISO,
-          wait_time: 0, // New location starts with 0 wait time
-        })
-        .select()
-        .single();
-
-      if (insertError) throw insertError;
-
-      // Update the ref with the new location
-      if (newLocation) {
-        lastLocationRef.current = {
-          lat: newLocation.latitude,
-          lng: newLocation.longitude,
-          id: newLocation.id,
-          timestamp: newLocation.timestamp,
-        };
-      }
-
+      // New location: store in IndexedDB first (sync and Background App Refresh will upload later)
+      console.log("[Location:update] adding new pending location", { lat, lng });
+      const pending = await addPendingLocation({
+        user_id: user.id,
+        latitude: lat,
+        longitude: lng,
+        timestamp: nowISO,
+        wait_time: 0,
+      });
+      lastLocationRef.current = {
+        lat: pending.latitude,
+        lng: pending.longitude,
+        id: pending.id,
+        timestamp: pending.timestamp,
+        isLocal: true,
+        wait_time: 0,
+      };
+      onPendingLocationsChange?.();
       onLocationUpdate();
     } catch (error) {
       console.error("Error saving location:", error);
     }
-  }, [user, supabase, onLocationUpdate]);
+  }, [user, supabase, onLocationUpdate, onPendingLocationsChange]);
 
   const startTracking = useCallback(async () => {
     if (!user) {
@@ -296,7 +329,7 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
       return;
     }
 
-    if (!navigator.geolocation) {
+    if (!isNativePlatform() && !navigator.geolocation) {
       setError("Geolocation is not supported by your browser");
       return;
     }
@@ -311,41 +344,121 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
     setIsRequesting(true);
     setError(null);
 
-    // Fetch the last location for this user to compare proximity
+    // Fetch last location from both Supabase and IndexedDB (pending) so proximity/wait_time use the true latest
     try {
-      const { data: lastLocation, error: fetchError } = await supabase
-        .from("locations")
-        .select("id, latitude, longitude, timestamp")
-        .eq("user_id", user.id)
-        .order("timestamp", { ascending: false })
-        .limit(1)
-        .single();
+      const [remoteResult, pendingList] = await Promise.all([
+        supabase
+          .from("locations")
+          .select("id, latitude, longitude, timestamp")
+          .eq("user_id", user.id)
+          .order("timestamp", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        getPendingLocationsForUser(user.id),
+      ]);
 
-      if (!fetchError && lastLocation) {
+      const remote = remoteResult.data;
+      const pendingSorted = [...pendingList].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      const lastPending = pendingSorted[0];
+
+      const remoteTime = remote ? new Date(remote.timestamp).getTime() : 0;
+      const pendingTime = lastPending ? new Date(lastPending.timestamp).getTime() : 0;
+
+      if (pendingTime >= remoteTime && lastPending) {
         lastLocationRef.current = {
-          lat: lastLocation.latitude,
-          lng: lastLocation.longitude,
-          id: lastLocation.id,
-          timestamp: lastLocation.timestamp,
+          lat: lastPending.latitude,
+          lng: lastPending.longitude,
+          id: lastPending.id,
+          timestamp: lastPending.timestamp,
+          isLocal: true,
+          wait_time: lastPending.wait_time ?? 0,
+        };
+      } else if (remote) {
+        lastLocationRef.current = {
+          lat: remote.latitude,
+          lng: remote.longitude,
+          id: remote.id,
+          timestamp: remote.timestamp,
         };
       } else {
-        // No previous location or error (which is fine for first time)
         lastLocationRef.current = null;
       }
     } catch (error) {
-      // If there's an error fetching, just start fresh
       lastLocationRef.current = null;
     }
 
-    // iOS Safari optimized options
     const geoOptions: PositionOptions = {
       enableHighAccuracy: true,
-      maximumAge: isIOSSafari() ? 10000 : 0, // iOS Safari benefits from some caching
-      timeout: isIOSSafari() ? 15000 : 10000, // iOS Safari may need more time
+      maximumAge: isIOSSafari() ? 10000 : 0,
+      timeout: isIOSSafari() ? 15000 : 10000,
     };
 
-    // Request location permission and get initial position
-    // This must be called directly from user interaction for iOS Safari
+    const onPosition = (latitude: number, longitude: number) => {
+      setCurrentLocation({ lat: latitude, lng: longitude });
+      const now = Date.now();
+      const shouldSave =
+        lastSaveTimeRef.current === null ||
+        now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
+      if (shouldSave) {
+        lastSaveTimeRef.current = now;
+        saveLocation(latitude, longitude);
+      }
+    };
+
+    const clearWatchRef = () => {
+      if (watchIdRef.current === null) return;
+      if (typeof watchIdRef.current === "string") {
+        Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
+      } else {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+      watchIdRef.current = null;
+    };
+
+    if (isNativePlatform()) {
+      // Use Capacitor Geolocation so native CLLocationManager can deliver updates in background
+      // (with "Always" permission and UIBackgroundModes location). Web navigator.geolocation is suspended when backgrounded.
+      try {
+        await Geolocation.requestPermissions();
+        const pos = await Geolocation.getCurrentPosition(geoOptions);
+        const { latitude, longitude } = pos.coords;
+        setCurrentLocation({ lat: latitude, lng: longitude });
+        lastSaveTimeRef.current = Date.now();
+        saveLocation(latitude, longitude);
+        setIsTracking(true);
+        setIsRequesting(false);
+        setPermissionStatus("granted");
+
+        const watchOptions: PositionOptions = {
+          enableHighAccuracy: true,
+          maximumAge: isIOSSafari() ? 5000 : 0,
+          timeout: isIOSSafari() ? 15000 : 10000,
+        };
+        const callbackId = await Geolocation.watchPosition(watchOptions, (position, err) => {
+          if (err) {
+            console.error("Error watching location (native):", err);
+            setError("Error tracking location. Please check permissions.");
+            setIsTracking(false);
+            clearWatchRef();
+            return;
+          }
+          if (position?.coords) {
+            onPosition(position.coords.latitude, position.coords.longitude);
+          }
+        });
+        watchIdRef.current = callbackId;
+      } catch (err) {
+        setIsRequesting(false);
+        setIsTracking(false);
+        setError(err instanceof Error ? err.message : "Unable to get your location.");
+        setPermissionStatus("denied");
+      }
+      return;
+    }
+
+    // Web: navigator.geolocation (suspended when app is backgrounded on iOS)
     navigator.geolocation.getCurrentPosition(
       (position) => {
         const { latitude, longitude } = position.coords;
@@ -356,7 +469,6 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
         setIsRequesting(false);
         setPermissionStatus("granted");
 
-        // Start watching position changes with iOS-optimized options
         const watchOptions: PositionOptions = {
           enableHighAccuracy: true,
           maximumAge: isIOSSafari() ? 5000 : 0,
@@ -364,22 +476,13 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
         };
 
         watchIdRef.current = navigator.geolocation.watchPosition(
-          (position) => {
-            const { latitude, longitude } = position.coords;
-            setCurrentLocation({ lat: latitude, lng: longitude });
-            const now = Date.now();
-            const shouldSave =
-              lastSaveTimeRef.current === null ||
-              now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
-            if (shouldSave) {
-              lastSaveTimeRef.current = now;
-              saveLocation(latitude, longitude);
-            }
+          (pos) => {
+            const { latitude, longitude } = pos.coords;
+            onPosition(latitude, longitude);
           },
           (error) => {
             console.error("Error watching location:", error);
             let errorMessage = "Error tracking location. ";
-            
             switch (error.code) {
               case error.PERMISSION_DENIED:
                 errorMessage += "Location permission was denied.";
@@ -394,13 +497,9 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
               default:
                 errorMessage += "Please check your permissions.";
             }
-            
             setError(errorMessage);
             setIsTracking(false);
-            if (watchIdRef.current !== null) {
-              navigator.geolocation.clearWatch(watchIdRef.current);
-              watchIdRef.current = null;
-            }
+            clearWatchRef();
           },
           watchOptions
         );
@@ -408,7 +507,6 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
       (error) => {
         setIsRequesting(false);
         setIsTracking(false);
-        
         let errorMessage = "Unable to get your location. ";
         switch (error.code) {
           case error.PERMISSION_DENIED:
@@ -440,10 +538,13 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
     setIsTracking(false);
     setError(null);
     if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
+      if (typeof watchIdRef.current === "string") {
+        Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
+      } else {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
       watchIdRef.current = null;
     }
-    // Reset refs when stopping tracking
     lastLocationRef.current = null;
     lastSaveTimeRef.current = null;
   }, []);
@@ -452,7 +553,12 @@ function LocationTracker({ user, onLocationUpdate }: { user: User | null; onLoca
   useEffect(() => {
     return () => {
       if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
+        if (typeof watchIdRef.current === "string") {
+          Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
+        } else {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+        }
+        watchIdRef.current = null;
       }
     };
   }, []);
@@ -991,7 +1097,7 @@ function MapController({ center, zoom }: { center: [number, number]; zoom?: numb
   return null;
 }
 
-export default function Map({ user, locations, photos = [], onLocationUpdate, focusLocation }: MapProps) {
+export default function Map({ user, locations, photos = [], onLocationUpdate, focusLocation, onPendingLocationsChange }: MapProps) {
   const [mapCenter, setMapCenter] = useState<[number, number]>([51.505, -0.09]); // Default to London
   const [zoomLevel, setZoomLevel] = useState<number>(13);
   const [viewportThreshold, setViewportThreshold] = useState<number>(0.0004); // Default threshold
@@ -1257,7 +1363,7 @@ export default function Map({ user, locations, photos = [], onLocationUpdate, fo
           />
         )}
       </MapContainer>
-      {user && <LocationTracker user={user} onLocationUpdate={onLocationUpdate} />}
+      {user && <LocationTracker user={user} onLocationUpdate={onLocationUpdate} onPendingLocationsChange={onPendingLocationsChange} />}
     </div>
   );
 }

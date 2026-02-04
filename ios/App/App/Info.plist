@@ -34,7 +34,7 @@
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>com.travel.app.uploadLocations</string>
+		<string>com.jeethtravel.app.uploadLocations</string>
 	</array>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>Travel records your location in the background so your travel path is saved even when the app is closed or in the background. Choose &quot;Always&quot; for continuous tracking.</string>

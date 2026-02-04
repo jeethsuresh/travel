@@ -9,6 +9,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         BackgroundRunnerPlugin.registerBackgroundTask()
+        // Schedule first run 5 min from now; task handler reschedules every 5 min after each run
+        try? BackgroundRunner.shared.scheduleBackgroundTasks()
         BackgroundRunnerPlugin.handleApplicationDidFinishLaunching(launchOptions: launchOptions)
         return true
     }

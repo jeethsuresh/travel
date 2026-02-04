@@ -2,7 +2,7 @@
 import type { CapacitorConfig } from "@capacitor/cli";
 
 const config: CapacitorConfig = {
-  appId: "com.travel.app",
+  appId: "com.jeethtravel.app",
   appName: "Travel",
   webDir: "out",
   server: {
@@ -13,11 +13,11 @@ const config: CapacitorConfig = {
   },
   plugins: {
     BackgroundRunner: {
-      label: "com.travel.app.uploadLocations",
+      label: "com.jeethtravel.app.uploadLocations",
       src: "runners/background.js",
       event: "uploadPendingLocations",
-      repeat: true,
-      interval: 5,
+      repeat: true, // reschedule 5 min after each run
+      interval: 5, // minutes between runs (earliestBeginDate)
       autoStart: true,
     },
   },
