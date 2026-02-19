@@ -1,0 +1,14 @@
+# Netlify config for Next.js app
+# https://docs.netlify.com/configure-builds/file-based-configuration/
+
+[build]
+  command = "npm run build"
+  # Next.js plugin (added automatically when you connect the repo) handles publish directory
+
+[build.environment]
+  NODE_VERSION = "20"
+  NPM_FLAGS = "--legacy-peer-deps"
+
+# Next.js with middleware and server features
+[functions]
+  node_bundler = "esbuild"

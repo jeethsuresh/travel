@@ -1,28 +1,37 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-
-import dynamicImport from "next/dynamic";
-import { createClient } from "@/lib/firebase/client";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { onAuthStateChanged } from "firebase/auth";
+import { collection, query, where, orderBy, limit, startAfter, getDocs, type DocumentSnapshot } from "firebase/firestore";
+import dynamicImport from "next/dynamic";
 import Auth from "@/components/Auth";
-import Friends from "@/components/Friends";
+import FriendsPanel from "@/components/FriendsPanel";
 import LocationHistory from "@/components/LocationHistory";
 import PhotoGallery from "@/components/PhotoGallery";
-import type { User as FirebaseUser } from "firebase/auth";
+import UserProfilePanel from "@/components/UserProfilePanel";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import type { User } from "@/lib/types";
+import { getFirebaseAuth, getFirebaseFirestore } from "@/lib/firebase";
 import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocation } from "@/lib/localStore";
-import { getAllLocalPhotosForUser, getLocalPhotoUrl } from "@/lib/localPhotoStorage";
-import { getPhotoMetadataForUser } from "@/lib/firebase/photos";
-import { collection, query, where, orderBy, limit, getDocs, addDoc, Timestamp } from "firebase/firestore";
+import { subscribeUserSettings } from "@/lib/userSettings";
+import { subscribeSharedLocationsForUser } from "@/lib/sharedLocations";
+import { updateMySharedLocation } from "@/lib/sharedLocations";
+import { isNativePlatform } from "@/lib/capacitor";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
-import { BackgroundRunner } from "@capacitor/background-runner";
-import { isNativePlatform } from "@/lib/capacitor";
+import type { MapHandle } from "@/components/Map";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
 const Map = dynamicImport(() => import("@/components/Map"), {
   ssr: false,
-  loading: () => <div className="flex items-center justify-center h-full">Loading map...</div>,
+  loading: () => <div className="flex items-center justify-center h-full bg-background">Loading map...</div>,
 });
 
 interface Location {
@@ -49,468 +58,185 @@ interface PhotoWithLocation {
   url?: string;
 }
 
-interface FriendLocation {
-  friend_id: string;
-  friend_email: string;
-  latitude: number;
-  longitude: number;
-  timestamp: string;
-}
-
 export default function Home() {
-  const [user, setUser] = useState<FirebaseUser | null>(null);
-  const [locations, setLocations] = useState<Location[]>([]);
-  const [locationsHasMore, setLocationsHasMore] = useState<boolean>(true);
-  const [locationsLoadingMore, setLocationsLoadingMore] = useState<boolean>(false);
+  const LOCATIONS_PAGE_SIZE = 50;
+
+  const [user, setUser] = useState<User | null>(null);
+  const [remoteLocations, setRemoteLocations] = useState<Location[]>([]);
+  const [lastVisible, setLastVisible] = useState<DocumentSnapshot | null>(null);
+  const [hasMoreLocations, setHasMoreLocations] = useState(false);
+  const [loadingLocations, setLoadingLocations] = useState(false);
+  const [pendingLocations, setPendingLocations] = useState<Location[]>([]);
   const [photos, setPhotos] = useState<PhotoWithLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [focusLocation, setFocusLocation] = useState<{ latitude: number; longitude: number } | null>(null);
-  const [friendLocations, setFriendLocations] = useState<FriendLocation[]>([]);
   const pendingPhotoUrlsRef = useRef<globalThis.Map<string, string>>(new globalThis.Map());
-  const isLoadingMoreRef = useRef<boolean>(false);
-  const locationsRef = useRef<Location[]>([]);
+  const mapRef = useRef<MapHandle | null>(null);
 
-  // Lazy initialization of Firebase client to avoid issues during build
-  const { auth, db } = useMemo(() => {
-    if (typeof window === 'undefined') {
-      return { auth: null, db: null };
-    }
-    return createClient();
-  }, []);
+  // Merged list: remote (newest first) + pending, sorted reverse-chronological. Map needs chronological so we derive that for Map only.
+  const locations = useMemo(() => {
+    const merged = [...remoteLocations, ...pendingLocations].sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+    return merged;
+  }, [remoteLocations, pendingLocations]);
 
-  useEffect(() => {
-    if (!auth) return;
-    
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setUser(user);
-      setLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, [auth]);
-
-  const LOCATIONS_PAGE_SIZE = 10;
-
-  const LOCATIONS_CACHE_KEY = "travel_locations_cache";
-
-  /** Persist locations to localStorage so they survive reload. */
-  const persistLocations = useCallback((userId: string, locs: Location[]) => {
-    if (typeof window === "undefined" || !locs.length) return;
-    try {
-      localStorage.setItem(
-        `${LOCATIONS_CACHE_KEY}_${userId}`,
-        JSON.stringify(locs)
-      );
-    } catch (e) {
-      console.warn("Failed to persist locations to localStorage", e);
-    }
-  }, []);
-
-  /** Restore locations from localStorage for the current user (used on reload). */
-  const restoreLocationsFromCache = useCallback((userId: string): Location[] => {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = localStorage.getItem(`${LOCATIONS_CACHE_KEY}_${userId}`);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw) as Location[];
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }, []);
-
-  /**
-   * Fetch a page of locations (remote + pending), newest first.
-   * - On initial load we fetch only the latest 10 rows from Supabase to avoid pulling the full history.
-   * - As the user scrolls the history list, we load additional pages of 10 using the timestamp cursor.
-   */
-  const fetchLocations = useCallback(
-    async ({ reset = false }: { reset?: boolean } = {}) => {
-      console.log("[Location:page] fetchLocations 1. Entry", {
-        hasUser: !!user,
-        hasDb: !!db,
-        reset,
-      });
-      if (!user || !db) {
-        console.log(
-          "[Location:page] fetchLocations 1b. Early return: no user or db"
-        );
-        setLocations([]);
-        setLocationsHasMore(false);
-        return;
-      }
-
-      // Prevent overlapping "load more" requests using ref.
-      // This guard and the loading flag only apply to non-reset "Load More" calls
-      // so that automatic refreshes (initial load, syncs) don't flip the button
-      // label to "Loading more..." or look like user-initiated pagination.
-      if (!reset) {
-        if (isLoadingMoreRef.current) {
-          console.log("[Location:page] fetchLocations - already loading, skipping");
-          return;
-        }
-        isLoadingMoreRef.current = true;
-        setLocationsLoadingMore(true);
-      }
-
-      try {
-        console.log(
-          "[Location:page] fetchLocations 2. Fetching remote page + pending"
-        );
-
-        // For pagination we always order by timestamp DESC so the newest items are first.
-        // When not resetting, request items strictly older than the last one we already have.
-        // Use ref to get current locations without causing dependency issues
-        const currentLocations = reset ? [] : locationsRef.current;
-        const lastKnownOldest =
-          currentLocations.length > 0
-            ? currentLocations[currentLocations.length - 1]
-            : null;
-
-        let locationsQuery = query(
-          collection(db, "locations"),
-          where("user_id", "==", user.uid),
-          orderBy("timestamp", "desc"),
-          limit(LOCATIONS_PAGE_SIZE + 1) // fetch one extra row to detect hasMore
-        );
-
-        // Note: Firestore doesn't support lt() with orderBy on different fields easily
-        // For now, we'll fetch and filter client-side. For better performance, consider
-        // using a timestamp-based cursor or composite index.
-        const [remoteSnapshot, pendingList] = await Promise.all([
-          getDocs(locationsQuery),
-          getPendingLocationsForUser(user.uid),
-        ]);
-
-        let remoteDesc = remoteSnapshot.docs.map((doc) => {
-          const data = doc.data();
-          return {
-            id: doc.id,
-            latitude: data.latitude,
-            longitude: data.longitude,
-            timestamp: data.timestamp instanceof Timestamp 
-              ? data.timestamp.toDate().toISOString() 
-              : data.timestamp,
-            wait_time: data.wait_time || 0,
-          };
-        });
-
-        // Filter by timestamp if paginating
-        if (!reset && lastKnownOldest) {
-          remoteDesc = remoteDesc.filter(
-            (loc) => new Date(loc.timestamp).getTime() < new Date(lastKnownOldest!.timestamp).getTime()
-          );
-        }
-
-        const hasMore = remoteDesc.length > LOCATIONS_PAGE_SIZE;
-        const pageRemoteDesc = remoteDesc.slice(0, LOCATIONS_PAGE_SIZE);
-
-        setLocationsHasMore(hasMore);
-
-        const pendingAsLocations: Location[] = pendingList.map((p) => ({
-          id: p.id,
-          latitude: p.latitude,
-          longitude: p.longitude,
-          timestamp: p.timestamp,
-          wait_time: p.wait_time,
-        }));
-
-        // Merge new page + pending into existing list, de-duplicated by id and sorted DESC (newest first)
-        setLocations((prev) => {
-          const base: Location[] = reset ? [] : prev;
-          const byId: Record<string, Location> = {};
-
-          for (const loc of base) {
-            byId[loc.id] = loc;
-          }
-          for (const loc of pageRemoteDesc as Location[]) {
-            if (loc && loc.id) {
-              byId[loc.id] = loc as Location;
-            }
-          }
-          for (const loc of pendingAsLocations) {
-            byId[loc.id] = loc;
-          }
-
-          const mergedArray = Object.values(byId).sort(
-            (a, b) =>
-              new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-          );
-
-          console.log("[Location:page] fetchLocations 3. Merged page", {
-            remotePageCount: pageRemoteDesc.length,
-            pendingCount: pendingList.length,
-            mergedCount: mergedArray.length,
-            hasMore,
-          });
-
-          return mergedArray;
-        });
-      } catch (error) {
-        console.error("[Location:page] fetchLocations Error:", error);
-      } finally {
-        if (!reset) {
-          isLoadingMoreRef.current = false;
-          setLocationsLoadingMore(false);
-        }
-      }
-    },
-    [user, db]
+  const locationsChronological = useMemo(
+    () => [...locations].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()),
+    [locations]
   );
 
-  const fetchFriendLocations = useCallback(async () => {
-    if (!user || !db) {
-      setFriendLocations([]);
+  // Tracking state from Map (for overlay buttons and Location History panel)
+  const [trackingState, setTrackingState] = useState<{
+    isTracking: boolean;
+    isRequesting: boolean;
+    error: string | null;
+    permissionStatus: PermissionState | null;
+    currentLocation: { lat: number; lng: number } | null;
+  }>({ isTracking: false, isRequesting: false, error: null, permissionStatus: null, currentLocation: null });
+
+  // Overlay panel state
+  const [locationHistoryOpen, setLocationHistoryOpen] = useState(false);
+  const [photosPanelOpen, setPhotosPanelOpen] = useState(false);
+  const [friendsPanelOpen, setFriendsPanelOpen] = useState(false);
+  const [profilePanelOpen, setProfilePanelOpen] = useState(false);
+  const [userDisplayName, setUserDisplayName] = useState("");
+  const [friendLocations, setFriendLocations] = useState<Array<{ user_id: string; display_name: string; lat: number; lng: number; timestamp: string; wait_time?: number }>>([]);
+
+  // Firebase auth state: require login
+  useEffect(() => {
+    const auth = getFirebaseAuth();
+    if (!auth) {
+      setLoading(false);
       return;
     }
-
-    try {
-      // Get friendships where current user is the friend and sharing is enabled
-      const friendshipsSnapshot = await getDocs(
-        query(
-          collection(db, "friendships"),
-          where("friend_id", "==", user.uid),
-          where("share_location_with_friend", "==", true)
-        )
-      );
-
-      // Get latest location for each friend
-      const friendLocationsPromises = friendshipsSnapshot.docs.map(async (friendshipDoc) => {
-        const friendshipData = friendshipDoc.data();
-        const friendUserId = friendshipData.user_id;
-        
-        // Get latest location for this friend
-        const locationsSnapshot = await getDocs(
-          query(
-            collection(db, "locations"),
-            where("user_id", "==", friendUserId),
-            orderBy("timestamp", "desc"),
-            limit(1)
-          )
-        );
-
-        if (locationsSnapshot.empty) return null;
-
-        const locationDoc = locationsSnapshot.docs[0];
-        const locationData = locationDoc.data();
-        
-        return {
-          friend_id: friendUserId,
-          friend_email: friendshipData.friend_email,
-          latitude: locationData.latitude,
-          longitude: locationData.longitude,
-          timestamp: locationData.timestamp instanceof Timestamp 
-            ? locationData.timestamp.toDate().toISOString() 
-            : locationData.timestamp,
-        };
-      });
-
-      const results = await Promise.all(friendLocationsPromises);
-      const rows = results.filter((r): r is FriendLocation => r !== null);
-      setFriendLocations(rows);
-    } catch (e) {
-      console.warn("[Friends] fetchFriendLocations failed", e);
-    }
-  }, [user, db]);
-
-  // Sync pending locations to Firestore (upload then remove from local).
-  // Battery-friendly: one batched HTTP insert per run, at most every 5 minutes via the interval below.
-  const syncPendingLocationsToFirestore = useCallback(async () => {
-    if (!user || !db) return;
-    try {
-      const pending = await getPendingLocationsForUser(user.uid);
-      if (pending.length === 0) return;
-
-      const now = Date.now();
-      const rows = pending.map((loc) => {
-        const storedWait = loc.wait_time ?? 0;
-        const elapsedSinceUpdate = Math.max(
-          0,
-          Math.floor((now - new Date(loc.timestamp).getTime()) / 1000)
-        );
-        const effectiveWaitTime = storedWait + elapsedSinceUpdate;
-        return {
-          user_id: loc.user_id,
-          latitude: loc.latitude,
-          longitude: loc.longitude,
-          timestamp: Timestamp.fromDate(new Date(loc.timestamp)),
-          wait_time: effectiveWaitTime,
-          created_at: Timestamp.now(),
-        };
-      });
-
-      // Insert all locations in parallel
-      await Promise.all(rows.map((row) => addDoc(collection(db, "locations"), row)));
-      
-      for (const loc of pending) {
-        await deletePendingLocation(loc.id);
-      }
-      // Clear any stale snapshot that might still be in native Preferences so the
-      // background runner doesn't re-upload already-synced locations.
-      if (isNativePlatform()) {
-        try {
-          await Preferences.remove({ key: "jeethtravel.pending" });
-        } catch {
-          // Best-effort; safe to ignore if this fails.
-        }
-      }
-      
-      // After syncing, refetch from the first page so the on-screen history/map stay up to date
-      fetchLocations({ reset: true });
-    } catch (e) {
-      console.warn("[Location:sync] Background sync failed", e);
-    }
-  }, [user, db, fetchLocations]);
-
-  // While the app is in the foreground, upload pending locations as often as every 30 seconds
-  // (single batched HTTP call per run). Background uploads are still throttled separately
-  // inside the native background runner.
-  useEffect(() => {
-    if (!user || !db) return;
-    const intervalMs = 30 * 1000;
-    const id = setInterval(syncPendingLocationsToFirestore, intervalMs);
-    return () => clearInterval(id);
-  }, [user, db, syncPendingLocationsToFirestore]);
-
-  // Sync pending + auth to Preferences so Background Runner can upload when OS runs the task (iOS/Android).
-  // Must run while app is in foreground: when we only sync on background, iOS often suspends before the
-  // async write completes, so the runner finds nothing. We sync proactively so data is there when the runner runs.
-  const syncPendingToPreferencesForRunner = useCallback(async () => {
-    if (!isNativePlatform() || !user || !auth) return;
-    try {
-      // First, apply any uploadedIds recorded by the background runner so we don't
-      // keep re-writing already-uploaded locations back into Preferences/IndexedDB.
-      try {
-        const { value: uploadedRaw } = await Preferences.get({
-          key: "jeethtravel.uploadedIds",
+    const unsub = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        setUser({
+          id: firebaseUser.uid,
+          email: firebaseUser.email ?? null,
         });
-        if (uploadedRaw) {
-          const uploadedIds = JSON.parse(uploadedRaw) as string[];
-          if (Array.isArray(uploadedIds) && uploadedIds.length > 0) {
-            console.log("[Location:Preferences] pruning uploadedIds before snapshot", {
-              count: uploadedIds.length,
-            });
-            for (const id of uploadedIds) {
-              await deletePendingLocation(id);
-            }
-          }
-          await Preferences.remove({ key: "jeethtravel.uploadedIds" });
-        }
-      } catch (e) {
-        console.warn("[Location:Preferences] failed to prune uploadedIds before snapshot", e);
-      }
-
-      const pending = await getPendingLocationsForUser(user.uid);
-      const token = await auth.currentUser?.getIdToken();
-      if (pending.length > 0 && token) {
-        await Preferences.set({
-          key: "jeethtravel.pending",
-          value: JSON.stringify(pending),
-        });
-        await Preferences.set({
-          key: "jeethtravel.firebaseAuth",
-          value: JSON.stringify({
-            projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-            apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-            accessToken: token,
-          }),
-        });
-        console.log("[Location:Preferences] synced pending to Preferences for runner", { count: pending.length });
-      }
-    } catch (e) {
-      console.warn("[Location:Preferences] sync for runner failed", e);
-    }
-  }, [user, auth]);
-
-  // Proactive sync: we only write to Preferences when pending locations change or on app
-  // background/foreground transitions. No periodic timer to minimize background work.
-
-  // Periodically refresh friends' latest locations so the map stays up to date
-  useEffect(() => {
-    if (!user || !db) return;
-    fetchFriendLocations();
-    const intervalMs = 30 * 1000;
-    const id = setInterval(fetchFriendLocations, intervalMs);
-    return () => clearInterval(id);
-  }, [user, db, fetchFriendLocations]);
-
-  // On app background: one more sync (best effort). On app active: apply uploadedIds from runner.
-  useEffect(() => {
-    if (!isNativePlatform()) return;
-    const listenerPromise = App.addListener("appStateChange", async (state) => {
-      if (state.isActive) {
-        try {
-          const { value } = await Preferences.get({ key: "jeethtravel.uploadedIds" });
-          if (value) {
-            const ids = JSON.parse(value) as string[];
-            console.log("[Location:uploadedIds] applying from runner", { count: ids.length });
-            for (const id of ids) await deletePendingLocation(id);
-            await Preferences.remove({ key: "jeethtravel.uploadedIds" });
-            fetchLocations({ reset: true });
-          }
-        } catch (e) {
-          console.warn("[Location:uploadedIds] apply failed", e);
-        }
       } else {
-        console.log("[Location:Preferences] app backgrounded, syncing pending for runner");
-        await syncPendingToPreferencesForRunner();
+        setUser(null);
       }
+      setLoading(false);
     });
-    return () => { listenerPromise.then((l) => l.remove()).catch(() => {}); };
-  }, [syncPendingToPreferencesForRunner, fetchLocations]);
+    return () => unsub();
+  }, []);
 
-  const RUNNER_LABEL = "com.jeethtravel.app.uploadLocations";
-  const testBackgroundUpload = useCallback(async () => {
-    if (!isNativePlatform() || !user) return;
-    try {
-      console.log("[Location:test] Syncing pending to Preferences, then dispatching runner…");
-      await syncPendingToPreferencesForRunner();
-      await BackgroundRunner.dispatchEvent({
-        label: RUNNER_LABEL,
-        event: "uploadPendingLocations",
-        details: {},
-      });
-      console.log("[Location:test] Runner finished");
-      fetchLocations({ reset: true });
-    } catch (e) {
-      console.error("[Location:test] Runner failed", e);
+  const handleSignOut = useCallback(() => {
+    setUser(null);
+  }, []);
+
+  const fetchLocations = useCallback(async () => {
+    if (!user) {
+      setRemoteLocations([]);
+      setPendingLocations([]);
+      setLastVisible(null);
+      setHasMoreLocations(false);
+      return;
     }
-  }, [user, syncPendingToPreferencesForRunner, fetchLocations]);
+    setLoadingLocations(true);
+    try {
+      const db = getFirebaseFirestore();
+      const [firestoreSnap, pendingList] = await Promise.all([
+        db
+          ? (() => {
+              const q = query(
+                collection(db, "locations"),
+                where("user_id", "==", user.id),
+                orderBy("timestamp", "desc"),
+                limit(LOCATIONS_PAGE_SIZE)
+              );
+              return getDocs(q);
+            })()
+          : Promise.resolve(null),
+        getPendingLocationsForUser(user.id),
+      ]);
+
+      const remote: Location[] = [];
+      let newLastVisible: DocumentSnapshot | null = null;
+      if (firestoreSnap && !firestoreSnap.empty) {
+        firestoreSnap.docs.forEach((doc) => {
+          const d = doc.data();
+          remote.push({
+            id: doc.id,
+            latitude: d.latitude ?? 0,
+            longitude: d.longitude ?? 0,
+            timestamp: d.timestamp ?? "",
+            wait_time: d.wait_time,
+          });
+        });
+        newLastVisible = firestoreSnap.docs[firestoreSnap.docs.length - 1];
+      }
+      setRemoteLocations(remote);
+      setLastVisible(newLastVisible);
+      setHasMoreLocations(firestoreSnap ? firestoreSnap.docs.length === LOCATIONS_PAGE_SIZE : false);
+
+      const pendingAsLocations: Location[] = pendingList.map((p) => ({
+        id: p.id,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        timestamp: p.timestamp,
+        wait_time: p.wait_time,
+      }));
+      setPendingLocations(pendingAsLocations);
+    } catch (error) {
+      console.error("[Location:page] fetchLocations Error:", error);
+    } finally {
+      setLoadingLocations(false);
+    }
+  }, [user]);
+
+  const loadMoreLocations = useCallback(async () => {
+    if (!user || !lastVisible || !hasMoreLocations) return;
+    const db = getFirebaseFirestore();
+    if (!db) return;
+    setLoadingLocations(true);
+    try {
+      const q = query(
+        collection(db, "locations"),
+        where("user_id", "==", user.id),
+        orderBy("timestamp", "desc"),
+        limit(LOCATIONS_PAGE_SIZE),
+        startAfter(lastVisible)
+      );
+      const snap = await getDocs(q);
+      if (snap.empty) {
+        setHasMoreLocations(false);
+        return;
+      }
+      const next: Location[] = [];
+      snap.docs.forEach((doc) => {
+        const d = doc.data();
+        next.push({
+          id: doc.id,
+          latitude: d.latitude ?? 0,
+          longitude: d.longitude ?? 0,
+          timestamp: d.timestamp ?? "",
+          wait_time: d.wait_time,
+        });
+      });
+      setRemoteLocations((prev) => [...prev, ...next]);
+      setLastVisible(snap.docs[snap.docs.length - 1]);
+      setHasMoreLocations(snap.docs.length === LOCATIONS_PAGE_SIZE);
+    } catch (error) {
+      console.error("[Location:page] loadMoreLocations Error:", error);
+    } finally {
+      setLoadingLocations(false);
+    }
+  }, [user, lastVisible, hasMoreLocations]);
 
   const fetchPhotos = useCallback(async () => {
     if (!user) {
       setPhotos([]);
       return;
     }
-
     try {
-      const [localRecords, pendingList, firestorePhotos] = await Promise.all([
-        getAllLocalPhotosForUser(user.uid),
-        getPendingPhotosForUser(user.uid),
-        db ? getPhotoMetadataForUser(db, user.uid) : Promise.resolve([]),
-      ]);
-
+      const pendingList = await getPendingPhotosForUser(user.id);
       pendingPhotoUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       pendingPhotoUrlsRef.current.clear();
-
-      const localWithUrls: PhotoWithLocation[] = await Promise.all(
-        localRecords
-          .filter((r) => r.latitude != null && r.longitude != null)
-          .map(async (rec) => {
-            const url = await getLocalPhotoUrl(rec);
-            pendingPhotoUrlsRef.current.set(rec.id, url);
-            return {
-              id: rec.id,
-              latitude: rec.latitude!,
-              longitude: rec.longitude!,
-              timestamp: rec.timestamp,
-              storage_path: "",
-              url,
-            };
-          })
-      );
-
-      const pendingPhotos: PhotoWithLocation[] = pendingList
+      const withLocation: PhotoWithLocation[] = pendingList
         .filter((p) => p.latitude != null && p.longitude != null)
         .map((p) => {
           const url = URL.createObjectURL(p.blob);
@@ -524,67 +250,116 @@ export default function Home() {
             url,
           };
         });
-
-      const localAndPendingIds = new Set([
-        ...localWithUrls.map((p) => p.id),
-        ...pendingPhotos.map((p) => p.id),
-      ]);
-      const firestoreOnlyWithLocation: PhotoWithLocation[] = firestorePhotos
-        .filter(
-          (m) =>
-            !localAndPendingIds.has(m.id) &&
-            m.latitude != null &&
-            m.longitude != null
-        )
-        .map((m) => ({
-          id: m.id,
-          latitude: m.latitude!,
-          longitude: m.longitude!,
-          timestamp: m.timestamp,
-          storage_path: "",
-          url: undefined,
-        }));
-
-      const merged = [
-        ...pendingPhotos,
-        ...localWithUrls,
-        ...firestoreOnlyWithLocation,
-      ].sort(
-        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-      );
-      setPhotos(merged);
+      withLocation.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      setPhotos(withLocation);
     } catch (error) {
       console.error("Error fetching photos:", error);
     }
-  }, [user, db]);
-
-  // Keep locationsRef in sync with locations state
-  useEffect(() => {
-    locationsRef.current = locations;
-  }, [locations]);
-
-  // Persist locations to localStorage whenever they change so they survive reload
-  useEffect(() => {
-    if (user && locations.length > 0) {
-      persistLocations(user.uid, locations);
-    }
-  }, [user, locations, persistLocations]);
+  }, [user]);
 
   useEffect(() => {
     if (user) {
-      // Restore from cache immediately so the map/history aren't empty on reload
-      const cached = restoreLocationsFromCache(user.uid);
-      if (cached.length > 0) {
-        setLocations(cached);
-      }
-      fetchLocations({ reset: true });
+      fetchLocations();
       fetchPhotos();
-      fetchFriendLocations();
     } else {
-      setLocations([]);
+      setRemoteLocations([]);
+      setPendingLocations([]);
+      setLastVisible(null);
+      setHasMoreLocations(false);
       setPhotos([]);
     }
-  }, [user, fetchLocations, fetchPhotos, fetchFriendLocations, restoreLocationsFromCache]);
+  }, [user, fetchLocations, fetchPhotos]);
+
+  // Sync pending locations + Firebase auth to Preferences so background runner can upload to Firestore
+  const syncPendingToPreferencesForRunner = useCallback(async () => {
+    if (!isNativePlatform() || !user) return;
+    const auth = getFirebaseAuth();
+    if (!auth?.currentUser) return;
+    try {
+      const pending = await getPendingLocationsForUser(user.id);
+      if (pending.length === 0) return;
+      const token = await auth.currentUser.getIdToken(true);
+      const projectId = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
+      if (!projectId) return;
+      await Preferences.set({
+        key: "jeethtravel.pending",
+        value: JSON.stringify(pending),
+      });
+      await Preferences.set({
+        key: "jeethtravel.firebaseAuth",
+        value: JSON.stringify({ projectId, idToken: token }),
+      });
+    } catch (e) {
+      console.warn("[Location:Preferences] sync for runner failed", e);
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (!isNativePlatform() || !user) return;
+    const intervalMs = 15 * 1000;
+    const id = setInterval(syncPendingToPreferencesForRunner, intervalMs);
+    syncPendingToPreferencesForRunner();
+    return () => clearInterval(id);
+  }, [user, syncPendingToPreferencesForRunner]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    const unsub = subscribeUserSettings(user.id, (s) => setUserDisplayName(s.displayName ?? ""));
+    return () => unsub();
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    const unsub = subscribeSharedLocationsForUser(user.id, setFriendLocations);
+    return () => unsub();
+  }, [user?.id]);
+
+  const handleLocationSaved = useCallback(
+    async (lat: number, lng: number, timestamp: string, waitTime?: number) => {
+      if (!user?.id) return;
+      await updateMySharedLocation(user.id, userDisplayName, lat, lng, timestamp, waitTime);
+    },
+    [user?.id, userDisplayName]
+  );
+
+  // When we have locations and share with friends, keep shared_locations in sync (e.g. after toggle or load)
+  useEffect(() => {
+    if (!user?.id || locations.length === 0) return;
+    const latest = locations[0];
+    updateMySharedLocation(
+      user.id,
+      userDisplayName,
+      latest.latitude,
+      latest.longitude,
+      latest.timestamp,
+      latest.wait_time
+    ).catch(() => {});
+  }, [user?.id, userDisplayName, locations.length, locations[0]?.timestamp]);
+
+  // On app active: apply uploadedIds from runner (remove from IndexedDB and refetch)
+  useEffect(() => {
+    if (!isNativePlatform()) return;
+    const listenerPromise = App.addListener("appStateChange", async (state) => {
+      if (state.isActive) {
+        try {
+          const { value } = await Preferences.get({ key: "jeethtravel.uploadedIds" });
+          if (value) {
+            const ids = JSON.parse(value) as string[];
+            for (const id of ids) await deletePendingLocation(id);
+            await Preferences.remove({ key: "jeethtravel.uploadedIds" });
+            fetchLocations();
+          }
+        } catch (e) {
+          console.warn("[Location:uploadedIds] apply failed", e);
+        }
+      } else {
+        syncPendingToPreferencesForRunner();
+      }
+    });
+    return () => {
+      listenerPromise.then((l) => l.remove()).catch(() => {});
+    };
+  }, [syncPendingToPreferencesForRunner, fetchLocations]);
 
   useEffect(() => {
     return () => {
@@ -595,104 +370,244 @@ export default function Home() {
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <p className="text-gray-500">Loading...</p>
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        <p className="text-muted-foreground">Loading...</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-zinc-950">
-      <div className="container mx-auto px-4 py-8">
-        <h1 className="text-3xl font-bold mb-6 text-gray-900 dark:text-gray-100">
-          Travel Location Tracker
-        </h1>
-
-        <div className="mb-6">
-          <Auth />
-        </div>
-
-        <Friends
+    <div className="fixed inset-0 flex flex-col bg-background">
+      {/* Full-screen map */}
+      <div className="absolute inset-0 z-0">
+        <Map
+          ref={mapRef}
           user={user}
-          onSharingChange={fetchFriendLocations}
-          friendsSharing={friendLocations}
-          onFriendFocus={(location) => setFocusLocation(location)}
+          locations={locationsChronological.map((loc: Location) => ({
+            lat: loc.latitude,
+            lng: loc.longitude,
+            timestamp: loc.timestamp,
+            wait_time: loc.wait_time,
+          }))}
+          photos={photos}
+          friendLocations={friendLocations}
+          onLocationUpdate={fetchLocations}
+          focusLocation={focusLocation}
+          onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
+          onTrackingChange={setTrackingState}
+          onLocationSaved={handleLocationSaved}
         />
+      </div>
 
-        {user && (
-          <>
-            {isNativePlatform() && (
-              <div className="mb-4 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
-                <button
-                  type="button"
-                  onClick={testBackgroundUpload}
-                  className="text-sm px-3 py-1.5 rounded bg-amber-500 text-white hover:bg-amber-600"
-                >
-                  Test background upload
-                </button>
-                <p className="text-xs text-amber-800 dark:text-amber-200 mt-2">
-                  Runs the same code iOS runs in background (check Xcode/console for [BackgroundAppRefresh] logs). Real background uploads run only on a physical device, usually 5–15+ minutes after you leave the app; iOS decides when. Enable Settings → General → Background App Refresh for this app.
-                </p>
-              </div>
-            )}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-              <div className="lg:col-span-2">
-                <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-md overflow-hidden" style={{ height: "600px" }}>
-                  <Map
-                    user={user}
-                    locations={locations.map((loc) => ({
-                      lat: loc.latitude,
-                      lng: loc.longitude,
-                      timestamp: loc.timestamp,
-                    }))}
-                    photos={photos}
-                    friendLocations={friendLocations}
-                    onLocationUpdate={fetchLocations}
-                    focusLocation={focusLocation}
-                    onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
-                  />
-                </div>
-              </div>
-              <div>
-                  <LocationHistory
-                    user={user}
-                    locations={locations}
-                    onLocationSelect={(location) => {
-                      setFocusLocation({
-                        latitude: location.latitude,
-                        longitude: location.longitude,
-                      });
-                    }}
-                    onRefresh={() => fetchLocations({ reset: true })}
-                    hasMore={locationsHasMore}
-                    isLoadingMore={locationsLoadingMore}
-                    onLoadMore={() => fetchLocations({ reset: false })}
-                  />
+      {/* Top-left: map title + navigation */}
+      <div className="absolute top-0 left-0 z-10 p-3">
+        <Card className="border-border/80 bg-card/95 shadow-lg backdrop-blur-sm">
+          <CardHeader className="pb-2 pt-3 px-3">
+            <CardTitle className="text-base font-semibold">Map</CardTitle>
+          </CardHeader>
+          <CardContent className="flex items-center gap-1 pt-0 px-3 pb-3">
+            <Button
+              variant="secondary"
+              size="icon"
+              onClick={() => mapRef.current?.zoomIn?.()}
+              aria-label="Zoom in"
+            >
+              <span className="text-lg font-semibold leading-none">+</span>
+            </Button>
+            <Button
+              variant="secondary"
+              size="icon"
+              onClick={() => mapRef.current?.zoomOut?.()}
+              aria-label="Zoom out"
+            >
+              <span className="text-lg font-semibold leading-none">−</span>
+            </Button>
+            <Button
+              variant="secondary"
+              size="icon"
+              onClick={() => mapRef.current?.flyToCurrentLocation?.()}
+              aria-label="My location"
+            >
+              <span className="text-sm">⌖</span>
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Top-right: Profile button (when signed in) */}
+      {user && (
+        <div className="absolute top-0 right-0 z-10 p-3">
+          <Button
+            variant="secondary"
+            className="bg-card/95 shadow-lg backdrop-blur-sm border-border/80"
+            onClick={() => setProfilePanelOpen(true)}
+          >
+            Profile
+          </Button>
+        </div>
+      )}
+
+      {/* User Profile panel (Sheet from right) */}
+      {user && (
+        <UserProfilePanel
+          user={user}
+          open={profilePanelOpen}
+          onOpenChange={setProfilePanelOpen}
+          onSignOut={handleSignOut}
+        />
+      )}
+
+      {/* Bottom bar: Start tracking + Location History */}
+      {user && (
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex justify-center gap-3 p-4 pb-[env(safe-area-inset-bottom)]">
+          <Button
+            onClick={() => mapRef.current?.toggleTracking?.()}
+            disabled={trackingState.isRequesting}
+            variant={trackingState.isTracking ? "destructive" : "default"}
+            className={
+              !trackingState.isTracking
+                ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                : ""
+            }
+          >
+            {trackingState.isRequesting ? "Requesting…" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
+          </Button>
+          <Button
+            variant="secondary"
+            className="bg-card/95 shadow-lg backdrop-blur-sm border-border/80"
+            onClick={() => setLocationHistoryOpen(true)}
+          >
+            Location history
+          </Button>
+        </div>
+      )}
+
+      {/* Right side: Photos + Friends buttons */}
+      {user && (
+        <div className="absolute top-1/2 right-0 z-10 flex flex-col gap-2 -translate-y-1/2 p-2">
+          <Button
+            variant="secondary"
+            className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
+            onClick={() => { setPhotosPanelOpen(true); setFriendsPanelOpen(false); }}
+            title="Photos"
+          >
+            <span className="text-xl">📷</span>
+            <span className="text-xs font-medium">Photos</span>
+          </Button>
+          <Button
+            variant="secondary"
+            className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
+            onClick={() => { setFriendsPanelOpen(true); setPhotosPanelOpen(false); }}
+            title="Friends"
+          >
+            <span className="text-xl">👥</span>
+            <span className="text-xs font-medium">Friends</span>
+          </Button>
+        </div>
+      )}
+
+      {/* Location History panel (Sheet from bottom) */}
+      {user && (
+        <Sheet open={locationHistoryOpen} onOpenChange={setLocationHistoryOpen}>
+          <SheetContent
+            side="bottom"
+            className="max-h-[85vh] flex flex-col pb-[env(safe-area-inset-bottom)]"
+          >
+            <SheetHeader>
+              <SheetTitle>Location history</SheetTitle>
+            </SheetHeader>
+            <div className="space-y-4 overflow-hidden flex flex-col flex-1 min-h-0">
+              <Card>
+                <CardContent className="pt-4 space-y-2">
+                  <Button
+                    className="w-full"
+                    variant={trackingState.isTracking ? "destructive" : "default"}
+                    disabled={trackingState.isRequesting}
+                    onClick={() => mapRef.current?.toggleTracking?.()}
+                  >
+                    {trackingState.isRequesting ? "Requesting…" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
+                  </Button>
+                  {trackingState.permissionStatus === "denied" && !trackingState.error && (
+                    <p className="text-xs text-amber-700 dark:text-amber-300">Location permission denied. Enable in settings to track.</p>
+                  )}
+                  {trackingState.error && (
+                    <p className="text-xs text-red-600 dark:text-red-400">{trackingState.error}</p>
+                  )}
+                  {trackingState.currentLocation && trackingState.isTracking && (
+                    <p className="text-xs font-mono text-muted-foreground">
+                      Current: {trackingState.currentLocation.lat.toFixed(5)}, {trackingState.currentLocation.lng.toFixed(5)}
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
+              <div className="flex-1 overflow-y-auto min-h-0">
+                <LocationHistory
+                  user={user}
+                  locations={locations}
+                  hasMore={hasMoreLocations}
+                  loadingMore={loadingLocations}
+                  onLoadMore={loadMoreLocations}
+                  onLocationSelect={(location) => {
+                    setFocusLocation({ latitude: location.latitude, longitude: location.longitude });
+                    setLocationHistoryOpen(false);
+                  }}
+                  onRefresh={fetchLocations}
+                />
               </div>
             </div>
-            <div>
-              <PhotoGallery 
-                user={user} 
+          </SheetContent>
+        </Sheet>
+      )}
+
+      {/* Photos panel (Sheet from right) */}
+      {user && (
+        <Sheet open={photosPanelOpen} onOpenChange={setPhotosPanelOpen}>
+          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0">
+            <SheetHeader className="p-4 border-b border-border">
+              <SheetTitle>Photos</SheetTitle>
+            </SheetHeader>
+            <div className="flex-1 overflow-y-auto">
+              <PhotoGallery
+                user={user}
                 onPhotoClick={(photo) => {
                   if (photo.latitude && photo.longitude) {
-                    setFocusLocation({
-                      latitude: photo.latitude,
-                      longitude: photo.longitude,
-                    });
+                    setFocusLocation({ latitude: photo.latitude, longitude: photo.longitude });
+                    setPhotosPanelOpen(false);
                   }
                 }}
                 onPhotosUpdate={fetchPhotos}
               />
             </div>
-          </>
-        )}
+          </SheetContent>
+        </Sheet>
+      )}
 
-        {!user && (
-          <div className="mt-8 text-center text-gray-500 dark:text-gray-400">
-            <p>Sign in to start tracking your location history</p>
+      {/* Friends panel (Sheet from right) */}
+      {user && (
+        <Sheet open={friendsPanelOpen} onOpenChange={setFriendsPanelOpen}>
+          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0">
+            <SheetHeader className="p-4 border-b border-border">
+              <SheetTitle>Friends</SheetTitle>
+            </SheetHeader>
+            <div className="flex-1 overflow-y-auto p-4">
+              <FriendsPanel
+                user={user}
+                userDisplayName={userDisplayName}
+                open={friendsPanelOpen}
+              />
+            </div>
+          </SheetContent>
+        </Sheet>
+      )}
+
+      {/* Signed-out message over map */}
+      {!user && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center p-4">
+          <div className="rounded-2xl bg-card/95 shadow-xl backdrop-blur-sm p-6 max-w-sm text-center border border-border">
+            <Auth user={user} onSignOut={handleSignOut} />
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }

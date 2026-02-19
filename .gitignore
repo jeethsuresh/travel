@@ -17,6 +17,16 @@
 /.next/
 /out/
 
+# firebase
+/dist
+/public/runners
+/public/service-worker.js
+/public/workbox-*.js
+/public/workbox-*.js.map
+/public/workbox-*.js.map.gz
+/public/workbox-*.js.map.br
+/public/workbox-*.js.map.br.gz
+/public/workbox-*.js.map.br.gz.br
 # production
 /build
 

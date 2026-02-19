@@ -41,24 +41,38 @@ function openDB(): Promise<IDBDatabase> {
       reject(new Error("IndexedDB only available in browser"));
       return;
     }
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-    request.onupgradeneeded = (event) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE_LOCATIONS)) {
-        db.createObjectStore(STORE_LOCATIONS, { keyPath: "id" });
-      }
-      if (!db.objectStoreNames.contains(STORE_PHOTOS)) {
-        db.createObjectStore(STORE_PHOTOS, { keyPath: "id" });
-      }
-      if (!db.objectStoreNames.contains(STORE_LOCAL_PHOTOS)) {
-        db.createObjectStore(STORE_LOCAL_PHOTOS, { keyPath: "id" });
-      }
-      if (!db.objectStoreNames.contains(STORE_TIMELINE)) {
-        db.createObjectStore(STORE_TIMELINE, { keyPath: "key" });
-      }
+    let retried = false;
+    const doOpen = () => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      request.onerror = () => {
+        const err = request.error;
+        // Stored DB was created with a higher version (e.g. after a rollback or deploy). Delete and retry once.
+        if (err?.name === "VersionError" && !retried) {
+          retried = true;
+          indexedDB.deleteDatabase(DB_NAME);
+          setTimeout(doOpen, 50);
+          return;
+        }
+        reject(err);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(STORE_LOCATIONS)) {
+          db.createObjectStore(STORE_LOCATIONS, { keyPath: "id" });
+        }
+        if (!db.objectStoreNames.contains(STORE_PHOTOS)) {
+          db.createObjectStore(STORE_PHOTOS, { keyPath: "id" });
+        }
+        if (!db.objectStoreNames.contains(STORE_LOCAL_PHOTOS)) {
+          db.createObjectStore(STORE_LOCAL_PHOTOS, { keyPath: "id" });
+        }
+        if (!db.objectStoreNames.contains(STORE_TIMELINE)) {
+          db.createObjectStore(STORE_TIMELINE, { keyPath: "key" });
+        }
+      };
     };
+    doOpen();
   });
 }
 

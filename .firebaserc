@@ -1,5 +1,6 @@
 {
   "projects": {
+    "default": "travel-2e0d3",
     "travel": "travel-2e0d3"
   },
   "targets": {},

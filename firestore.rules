@@ -47,8 +47,7 @@ service cloud.firestore {
         request.resource.data.requester_id == request.auth.uid &&
         request.resource.data.requester_email == request.auth.token.email;
       allow update: if isAuthenticated() &&
-        resource.data.recipient_email == request.auth.token.email &&
-        request.resource.data.recipient_email == request.auth.token.email;
+        resource.data.recipient_email == request.auth.token.email;
       allow delete: if isAuthenticated() && resource.data.requester_id == request.auth.uid;
     }
 
@@ -66,6 +65,23 @@ service cloud.firestore {
         resource.data.user_id == request.auth.uid &&
         request.resource.data.user_id == request.auth.uid;
       allow delete: if isAuthenticated() && resource.data.user_id == request.auth.uid;
+    }
+
+    // -------------------------------------------------------------------------
+    // user_settings: each document is keyed by user_id. User may only access own.
+    // -------------------------------------------------------------------------
+    match /user_settings/{userId} {
+      allow read, write: if isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // -------------------------------------------------------------------------
+    // shared_locations: doc id = user_id who is sharing. Contains shared_with array.
+    // Owner can write; anyone in shared_with can read.
+    // -------------------------------------------------------------------------
+    match /shared_locations/{ownerId} {
+      allow read: if isAuthenticated() && request.auth.uid in resource.data.shared_with;
+      allow create, update: if isAuthenticated() && request.auth.uid == ownerId;
+      allow delete: if isAuthenticated() && request.auth.uid == ownerId;
     }
 
     // -------------------------------------------------------------------------

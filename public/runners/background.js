@@ -1,4 +1,5 @@
 /**
+<<<<<<< HEAD
  * Background Runner: minimal, battery-friendly uploader.
  *
  * Responsibilities:
@@ -7,6 +8,11 @@
  * - Send all pending locations in a single batched insert to Firestore.
  *
  * Main app writes `jeethtravel.pending` and `jeethtravel.firebaseAuth` via Preferences; we read and upload.
+=======
+ * Background Runner: uploads pending locations to Firebase Firestore when iOS/Android runs this task.
+ * Reads from CapacitorKV (same store as @capacitor/preferences: use "CapacitorStorage.<key>").
+ * Main app writes jeethtravel.pending and jeethtravel.firebaseAuth (projectId + idToken) via Preferences.
+>>>>>>> 4dcfc75 (new UI)
  */
 addEventListener("uploadPendingLocations", async function (resolve, reject) {
   try {
@@ -30,11 +36,16 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
 
     var pending = JSON.parse(pendingJson);
     var auth = JSON.parse(authJson);
+<<<<<<< HEAD
     if (!Array.isArray(pending) || pending.length === 0 || !auth.projectId || !auth.accessToken) {
+=======
+    if (!Array.isArray(pending) || pending.length === 0 || !auth.projectId || !auth.idToken) {
+>>>>>>> 4dcfc75 (new UI)
       resolve();
       return;
     }
 
+<<<<<<< HEAD
     var nowMs = Date.now();
     var lastUploadMs = 0;
     if (lastUploadValue) {
@@ -64,6 +75,16 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
     // Firestore REST API uses a batch write format
     var writes = [];
     var uploadedIds = [];
+=======
+    var projectId = auth.projectId;
+    var idToken = auth.idToken;
+    var baseUrl = "https://firestore.googleapis.com/v1/projects/" + projectId + "/databases/(default)/documents/locations";
+
+    var uploadedIds = [];
+    var allOk = true;
+    var nowMs = Date.now();
+
+>>>>>>> 4dcfc75 (new UI)
     for (var i = 0; i < pending.length; i++) {
       var loc = pending[i];
       var storedWait = loc.wait_time != null ? loc.wait_time : 0;
@@ -71,6 +92,7 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
       var elapsedSinceUpdate = Math.max(0, Math.floor((nowMs - timestampMs) / 1000));
       var effectiveWaitTime = storedWait + elapsedSinceUpdate;
 
+<<<<<<< HEAD
       // Convert timestamp to Firestore timestamp format
       var timestampSeconds = Math.floor(timestampMs / 1000);
       var timestampNanos = (timestampMs % 1000) * 1000000;
@@ -96,6 +118,35 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
         }
       });
       uploadedIds.push(loc.id);
+=======
+      var docId = loc.id;
+      var body = JSON.stringify({
+        fields: {
+          user_id: { stringValue: loc.user_id },
+          latitude: { doubleValue: loc.latitude },
+          longitude: { doubleValue: loc.longitude },
+          timestamp: { stringValue: loc.timestamp },
+          wait_time: { integerValue: String(Math.round(effectiveWaitTime)) },
+        },
+      });
+
+      var url = baseUrl + "?documentId=" + encodeURIComponent(docId);
+      var res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + idToken,
+          "Content-Type": "application/json",
+        },
+        body: body,
+      });
+
+      if (res && res.status >= 200 && res.status < 300) {
+        uploadedIds.push(loc.id);
+      } else {
+        allOk = false;
+        break;
+      }
+>>>>>>> 4dcfc75 (new UI)
     }
 
     // Use Firestore batch write API
@@ -113,7 +164,10 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
     if (res && res.status >= 200 && res.status < 300 && uploadedIds.length > 0) {
       CapacitorKV.set(uploadedIdsKey, JSON.stringify(uploadedIds));
       CapacitorKV.remove(pendingKey);
+<<<<<<< HEAD
       CapacitorKV.set(lastUploadKey, String(nowMs));
+=======
+>>>>>>> 4dcfc75 (new UI)
     }
     resolve();
   } catch (err) {

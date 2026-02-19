@@ -1,12 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo, forwardRef, useImperativeHandle } from "react";
 import { MapContainer, TileLayer, Marker, Polyline, Popup, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { createClient } from "@/lib/firebase/client";
-import { collection, query, where, orderBy, limit, getDocs, Timestamp } from "firebase/firestore";
-import type { User as FirebaseUser } from "firebase/auth";
+import type { User } from "@/lib/types";
 import {
   addPendingLocation,
   updatePendingLocation,
@@ -14,28 +12,6 @@ import {
 } from "@/lib/localStore";
 import { Geolocation } from "@capacitor/geolocation";
 import { isNativePlatform } from "@/lib/capacitor";
-
-/** Distance in meters between two lat/lng points (Haversine). */
-function distanceMeters(
-  lat1: number,
-  lng1: number,
-  lat2: number,
-  lng2: number
-): number {
-  const R = 6371000; // Earth radius in meters
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-const SAME_LOCATION_RADIUS_M = 100;
 
 // Fix for default marker icons in Next.js - only run on client
 if (typeof window !== "undefined") {
@@ -75,15 +51,6 @@ const createEndIcon = () => {
   });
 };
 
-const createFriendIcon = (color: string) => {
-  return L.divIcon({
-    className: "friend-marker",
-    html: `<div style="width: 14px; height: 14px; background-color: ${color}; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 2px rgba(0,0,0,0.25);"></div>`,
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
-  });
-};
-
 const createPhotoIcon = (isFocused: boolean = false) => {
   const size = isFocused ? 20 : 12;
   const borderWidth = isFocused ? 3 : 2;
@@ -111,6 +78,17 @@ const createClusterIcon = (count: number) => {
   });
 };
 
+// Friend location: larger bubble, different colour, initials
+const FRIEND_MARKER_SIZE = 36;
+const createFriendLocationIcon = (initials: string) => {
+  return L.divIcon({
+    className: "friend-location-marker",
+    html: `<div style="width: ${FRIEND_MARKER_SIZE}px; height: ${FRIEND_MARKER_SIZE}px; background-color: #ea580c; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 0 2px rgba(234,88,12,0.4); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 12px; cursor: pointer; pointer-events: auto; line-height: 1;">${initials}</div>`,
+    iconSize: [FRIEND_MARKER_SIZE, FRIEND_MARKER_SIZE],
+    iconAnchor: [FRIEND_MARKER_SIZE / 2, FRIEND_MARKER_SIZE / 2],
+  });
+};
+
 interface Location {
   lat: number;
   lng: number;
@@ -127,23 +105,29 @@ interface Photo {
   url?: string;
 }
 
-interface FriendLocation {
-  friend_id: string;
-  friend_email: string;
-  latitude: number;
-  longitude: number;
+export interface FriendLocation {
+  user_id: string;
+  display_name: string;
+  lat: number;
+  lng: number;
   timestamp: string;
+  wait_time?: number;
 }
 
 interface MapProps {
-  user: FirebaseUser | null;
+  user: User | null;
   locations: Location[];
   photos?: Photo[];
+  /** Friend locations to show (when they share with you) */
   friendLocations?: FriendLocation[];
   onLocationUpdate: () => void;
   focusLocation?: { latitude: number; longitude: number } | null;
   /** Called when pending locations change so the page can sync to Preferences for the background runner */
   onPendingLocationsChange?: () => void;
+  /** Called when tracking state changes (for overlay UI) */
+  onTrackingChange?: (state: Omit<MapTrackingHandle, "toggleTracking">) => void;
+  /** Called when we save a location (so page can update shared_locations for friends) */
+  onLocationSaved?: (lat: number, lng: number, timestamp: string, waitTime?: number) => void;
 }
 
 // Detect iOS Safari
@@ -233,7 +217,22 @@ const getClusterThreshold = (zoom: number): number => {
   }
 };
 
-function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: { user: FirebaseUser | null; onLocationUpdate: () => void; onPendingLocationsChange?: () => void }) {
+export interface MapTrackingHandle {
+  toggleTracking: () => void;
+  isTracking: boolean;
+  isRequesting: boolean;
+  error: string | null;
+  permissionStatus: PermissionState | null;
+  currentLocation: { lat: number; lng: number } | null;
+}
+
+const LocationTracker = forwardRef<MapTrackingHandle, {
+  user: User | null;
+  onLocationUpdate: () => void;
+  onPendingLocationsChange?: () => void;
+  onTrackingChange?: (state: Omit<MapTrackingHandle, "toggleTracking">) => void;
+  onLocationSaved?: (lat: number, lng: number, timestamp: string, waitTime?: number) => void;
+}>(function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange, onTrackingChange, onLocationSaved }, ref) {
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [isTracking, setIsTracking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -241,8 +240,6 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
   const [permissionStatus, setPermissionStatus] = useState<PermissionState | null>(null);
   // number = navigator.geolocation watch ID; string = Capacitor Geolocation callback ID
   const watchIdRef = useRef<number | string | null>(null);
-  // Timestamp in ms of the last time we actually persisted a location (for throttling).
-  const lastSavedAtRef = useRef<number | null>(null);
   const lastLocationRef = useRef<{
     lat: number;
     lng: number;
@@ -251,7 +248,8 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
     isLocal?: boolean;
     wait_time?: number;
   } | null>(null);
-  const { db } = createClient();
+  const lastSaveTimeRef = useRef<number | null>(null);
+  const TRACKING_INTERVAL_MS = 5 * 60 * 1000; // Save location at most once every 5 minutes
 
   // Check permission status on mount
   useEffect(() => {
@@ -260,60 +258,38 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
     });
   }, []);
 
-  const saveLocation = useCallback(
-    async (lat: number, lng: number) => {
-      if (!user) return;
+  const saveLocation = useCallback(async (lat: number, lng: number) => {
+    if (!user) return;
 
-      console.log("[Location:update] saveLocation called", { lat, lng });
+    console.log("[Location:update] saveLocation called", { lat, lng });
 
+    try {
       const now = new Date();
       const nowISO = now.toISOString();
 
-      let handledWithUpdate = false;
-
-      // 1) If within 100m of the last location: update wait_time if last was local, else skip (no new entry).
+      // Check if we have a last location and if it's close enough (update wait_time)
       if (lastLocationRef.current) {
-        const distM = distanceMeters(
+        const distance = calculateDistance(
           lastLocationRef.current.lat,
           lastLocationRef.current.lng,
           lat,
           lng
         );
-        if (distM <= SAME_LOCATION_RADIUS_M && !lastLocationRef.current.isLocal) {
-          // Last was remote (Firestore); we can't update it, so skip this poll to avoid duplicate entry.
-          return;
-        }
-      }
 
-      if (lastLocationRef.current && lastLocationRef.current.isLocal) {
-        try {
-          const distM = distanceMeters(
-            lastLocationRef.current.lat,
-            lastLocationRef.current.lng,
-            lat,
-            lng
-          );
-          if (distM <= SAME_LOCATION_RADIUS_M) {
-            const lastTimestamp = new Date(lastLocationRef.current.timestamp);
-            const timeDiff = Math.floor(
-              (now.getTime() - lastTimestamp.getTime()) / 1000
-            ); // seconds
-            const newWaitTime =
-              (lastLocationRef.current.wait_time ?? 0) + timeDiff;
+        if (distance < PROXIMITY_THRESHOLD) {
+          const lastTimestamp = new Date(lastLocationRef.current.timestamp);
+          const timeDiff = Math.floor((now.getTime() - lastTimestamp.getTime()) / 1000); // seconds
 
-            console.log("[Location:update] updating pending wait_time", {
-              id: lastLocationRef.current.id,
-              timeDiff,
-              newWaitTime,
-            });
-
+          // Last location is in IndexedDB (pending): update wait_time locally for next sync/Background App Refresh
+          if (lastLocationRef.current.isLocal) {
+            const newWaitTime = (lastLocationRef.current.wait_time ?? 0) + timeDiff;
+            console.log("[Location:update] updating pending wait_time", { id: lastLocationRef.current.id, timeDiff, newWaitTime });
             await updatePendingLocation(lastLocationRef.current.id, {
               wait_time: newWaitTime,
               timestamp: nowISO,
               latitude: lat,
               longitude: lng,
             });
-
             lastLocationRef.current = {
               ...lastLocationRef.current,
               lat,
@@ -321,72 +297,40 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
               timestamp: nowISO,
               wait_time: newWaitTime,
             };
-
-            handledWithUpdate = true;
             onPendingLocationsChange?.();
             onLocationUpdate();
+            onLocationSaved?.(lat, lng, nowISO, newWaitTime);
+            return;
           }
-        } catch (err) {
-          // Most likely the pending row was deleted (e.g. user cleared storage)
-          // while our in-memory ref still points at it. Reset and fall back to
-          // creating a fresh pending row instead of failing the whole save.
-          const errorInfo =
-            err instanceof Error
-              ? { name: err.name, message: err.message }
-              : err;
-          console.error(
-            "[Location:update] failed to update pending location; will create new one",
-            {
-              id: lastLocationRef.current?.id,
-              error: errorInfo,
-            }
-          );
-          lastLocationRef.current = null;
+
+          // No remote storage: treat non-local last as stale and add new pending below
         }
       }
 
-      if (handledWithUpdate) {
-        return;
-      }
-
-      // 2) Otherwise, create a brand new pending location entry.
-      try {
-        console.log("[Location:update] adding new pending location", {
-          lat,
-          lng,
-        });
-
-        const pending = await addPendingLocation({
-          user_id: user.uid,
-          latitude: lat,
-          longitude: lng,
-          timestamp: nowISO,
-          wait_time: 0,
-        });
-
-        lastLocationRef.current = {
-          lat: pending.latitude,
-          lng: pending.longitude,
-          id: pending.id,
-          timestamp: pending.timestamp,
-          isLocal: true,
-          wait_time: pending.wait_time,
-        };
-
-        onPendingLocationsChange?.();
-        onLocationUpdate();
-      } catch (err) {
-        const errorInfo =
-          err instanceof Error ? { name: err.name, message: err.message } : err;
-        console.error("[Location:update] Error adding new pending location", {
-          lat,
-          lng,
-          error: errorInfo,
-        });
-      }
-    },
-    [user, onLocationUpdate, onPendingLocationsChange]
-  );
+      // New location: store in IndexedDB first (sync and Background App Refresh will upload later)
+      console.log("[Location:update] adding new pending location", { lat, lng });
+      const pending = await addPendingLocation({
+        user_id: user.id,
+        latitude: lat,
+        longitude: lng,
+        timestamp: nowISO,
+        wait_time: 0,
+      });
+      lastLocationRef.current = {
+        lat: pending.latitude,
+        lng: pending.longitude,
+        id: pending.id,
+        timestamp: pending.timestamp,
+        isLocal: true,
+        wait_time: 0,
+      };
+      onPendingLocationsChange?.();
+      onLocationUpdate();
+      onLocationSaved?.(lat, lng, pending.timestamp, 0);
+    } catch (error) {
+      console.error("Error saving location:", error);
+    }
+  }, [user, onLocationUpdate, onPendingLocationsChange, onLocationSaved]);
 
   const startTracking = useCallback(async () => {
     if (!user) {
@@ -409,38 +353,13 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
     setIsRequesting(true);
     setError(null);
 
-    // Fetch last location from both Firestore and IndexedDB (pending) so proximity/wait_time use the true latest
     try {
-      const [remoteSnapshot, pendingList] = await Promise.all([
-        getDocs(
-          query(
-            collection(db, "locations"),
-            where("user_id", "==", user.uid),
-            orderBy("timestamp", "desc"),
-            limit(1)
-          )
-        ),
-        getPendingLocationsForUser(user.uid),
-      ]);
-
-      const remoteDoc = remoteSnapshot.docs[0];
-      const remote = remoteDoc ? {
-        id: remoteDoc.id,
-        latitude: remoteDoc.data().latitude,
-        longitude: remoteDoc.data().longitude,
-        timestamp: remoteDoc.data().timestamp instanceof Timestamp 
-          ? remoteDoc.data().timestamp.toDate().toISOString() 
-          : remoteDoc.data().timestamp,
-      } : null;
+      const pendingList = await getPendingLocationsForUser(user.id);
       const pendingSorted = [...pendingList].sort(
         (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       );
       const lastPending = pendingSorted[0];
-
-      const remoteTime = remote ? new Date(remote.timestamp).getTime() : 0;
-      const pendingTime = lastPending ? new Date(lastPending.timestamp).getTime() : 0;
-
-      if (pendingTime >= remoteTime && lastPending) {
+      if (lastPending) {
         lastLocationRef.current = {
           lat: lastPending.latitude,
           lng: lastPending.longitude,
@@ -449,17 +368,10 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
           isLocal: true,
           wait_time: lastPending.wait_time ?? 0,
         };
-      } else if (remote) {
-        lastLocationRef.current = {
-          lat: remote.latitude,
-          lng: remote.longitude,
-          id: remote.id,
-          timestamp: remote.timestamp,
-        };
       } else {
         lastLocationRef.current = null;
       }
-    } catch (error) {
+    } catch {
       lastLocationRef.current = null;
     }
 
@@ -471,21 +383,14 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
 
     const onPosition = (latitude: number, longitude: number) => {
       setCurrentLocation({ lat: latitude, lng: longitude });
-
-      // Throttle persisted updates to at most once every 30 seconds. The native
-      // watchers can still fire more frequently, but we don't need to write a new
-      // pending row or top up wait_time every single second.
-      const nowMs = Date.now();
-      const lastSavedMs = lastSavedAtRef.current;
-      const THROTTLE_MS = 30_000;
-      if (lastSavedMs != null && nowMs - lastSavedMs < THROTTLE_MS) {
-        return;
+      const now = Date.now();
+      const shouldSave =
+        lastSaveTimeRef.current === null ||
+        now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
+      if (shouldSave) {
+        lastSaveTimeRef.current = now;
+        saveLocation(latitude, longitude);
       }
-      lastSavedAtRef.current = nowMs;
-
-      // Purely local processing: compare against the last point and either append a new
-      // pending row or top up wait_time on the last one. No network calls here.
-      void saveLocation(latitude, longitude);
     };
 
     const clearWatchRef = () => {
@@ -506,7 +411,8 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
         const pos = await Geolocation.getCurrentPosition(geoOptions);
         const { latitude, longitude } = pos.coords;
         setCurrentLocation({ lat: latitude, lng: longitude });
-        await saveLocation(latitude, longitude);
+        lastSaveTimeRef.current = Date.now();
+        saveLocation(latitude, longitude);
         setIsTracking(true);
         setIsRequesting(false);
         setPermissionStatus("granted");
@@ -550,7 +456,8 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
       (position) => {
         const { latitude, longitude } = position.coords;
         setCurrentLocation({ lat: latitude, lng: longitude });
-        void saveLocation(latitude, longitude);
+        lastSaveTimeRef.current = Date.now();
+        saveLocation(latitude, longitude);
         setIsTracking(true);
         setIsRequesting(false);
         setPermissionStatus("granted");
@@ -619,7 +526,7 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
       },
       geoOptions
     );
-  }, [user, db, saveLocation]);
+  }, [user, saveLocation]);
 
   const stopTracking = useCallback(() => {
     setIsTracking(false);
@@ -633,6 +540,7 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
       watchIdRef.current = null;
     }
     lastLocationRef.current = null;
+    lastSaveTimeRef.current = null;
   }, []);
 
   // Cleanup on unmount
@@ -649,53 +557,35 @@ function LocationTracker({ user, onLocationUpdate, onPendingLocationsChange }: {
     };
   }, []);
 
-  const handleToggleTracking = () => {
+  const handleToggleTracking = useCallback(() => {
     if (isTracking) {
       stopTracking();
     } else {
       startTracking();
     }
-  };
+  }, [isTracking, startTracking, stopTracking]);
 
-  return (
-    <div className="absolute top-4 right-4 z-[1000] flex flex-col gap-2">
-      <button
-        onClick={handleToggleTracking}
-        disabled={isRequesting}
-        className={`px-4 py-2 rounded-md text-white font-medium shadow-lg transition-opacity ${
-          isTracking
-            ? "bg-red-500 hover:bg-red-600"
-            : "bg-green-500 hover:bg-green-600"
-        } ${isRequesting ? "opacity-50 cursor-not-allowed" : ""}`}
-      >
-        {isRequesting ? "Requesting..." : isTracking ? "Stop Tracking" : "Start Tracking"}
-      </button>
-      
-      {permissionStatus === "denied" && !error && (
-        <div className="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 px-3 py-2 rounded-md shadow-lg text-sm max-w-xs">
-          <p className="text-yellow-800 dark:text-yellow-200 text-xs">
-            Location permission denied. {isIOSSafari() && "Go to Settings > Safari > Location Services to enable."}
-          </p>
-        </div>
-      )}
-      
-      {error && (
-        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-3 py-2 rounded-md shadow-lg text-sm max-w-xs">
-          <p className="text-red-800 dark:text-red-200 text-xs">{error}</p>
-        </div>
-      )}
-      
-      {currentLocation && isTracking && (
-        <div className="bg-white dark:bg-zinc-900 px-3 py-2 rounded-md shadow-lg text-sm">
-          <p className="text-gray-600 dark:text-gray-400">Current Location:</p>
-          <p className="font-mono text-xs">
-            {currentLocation.lat.toFixed(6)}, {currentLocation.lng.toFixed(6)}
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
+  useImperativeHandle(ref, () => ({
+    toggleTracking: handleToggleTracking,
+    isTracking,
+    isRequesting,
+    error,
+    permissionStatus,
+    currentLocation,
+  }), [handleToggleTracking, isTracking, isRequesting, error, permissionStatus, currentLocation]);
+
+  useEffect(() => {
+    onTrackingChange?.({
+      isTracking,
+      isRequesting,
+      error,
+      permissionStatus,
+      currentLocation,
+    });
+  }, [isTracking, isRequesting, error, permissionStatus, currentLocation, onTrackingChange]);
+
+  return null;
+});
 
 // Calculate distance between two coordinates in degrees
 const getDistance = (lat1: number, lng1: number, lat2: number, lng2: number): number => {
@@ -896,7 +786,7 @@ function PhotoMarkers({
 }: { 
   photoGroups: Array<{ photos: Photo[]; center: [number, number] }>;
   focusLocation: { latitude: number; longitude: number } | null;
-  user: FirebaseUser | null;
+  user: User | null;
   zoomLevel: number;
 }) {
   return (
@@ -938,61 +828,15 @@ function PhotoMarkers({
   );
 }
 
-function ClusterPopup({ photos, user }: { photos: Photo[]; user: FirebaseUser | null }) {
+function ClusterPopup({ photos }: { photos: Photo[]; user: User | null }) {
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [imageUrls, setImageUrls] = useState<{ [key: string]: string | null }>({});
-  const [loading, setLoading] = useState<{ [key: string]: boolean }>({});
-  const loadedPhotosRef = useRef<Set<string>>(new Set());
-
   const currentPhoto = photos[currentIndex];
-
-  // Reset loaded photos when photos array changes
-  useEffect(() => {
-    loadedPhotosRef.current.clear();
-    setImageUrls({});
-    setLoading({});
-    setCurrentIndex(0);
-  }, [photos.map(p => p.id).join(',')]);
-
-  useEffect(() => {
-    const loadImages = async () => {
-      // Check which photos need to be loaded
-      const photosToLoad = photos.filter((p) => {
-        // Load if we haven't loaded this photo yet
-        return !loadedPhotosRef.current.has(p.id);
-      });
-
-      if (photosToLoad.length === 0) return;
-
-      // Mark photos as being loaded
-      photosToLoad.forEach((photo) => {
-        loadedPhotosRef.current.add(photo.id);
-        setLoading((prev) => ({ ...prev, [photo.id]: true }));
-      });
-
-      // Mark photos as loading
-      photosToLoad.forEach((photo) => {
-        setLoading((prev) => ({ ...prev, [photo.id]: true }));
-      });
-
-      // All photos now have url from local storage (blob or Capacitor file URL)
-      await Promise.all(
-        photosToLoad.map(async (photo) => {
-          try {
-            const url = photo.url || null;
-            setImageUrls((prev) => ({ ...prev, [photo.id]: url }));
-          } catch (error) {
-            console.error(`Error loading photo URL for ${photo.id}:`, error);
-            setImageUrls((prev) => ({ ...prev, [photo.id]: null }));
-          } finally {
-            setLoading((prev) => ({ ...prev, [photo.id]: false }));
-          }
-        })
-      );
-    };
-
-    loadImages();
+  const imageUrls = useMemo(() => {
+    const out: { [key: string]: string | null } = {};
+    photos.forEach((p) => { out[p.id] = p.url ?? null; });
+    return out;
   }, [photos]);
+  const isLoading = currentPhoto ? !imageUrls[currentPhoto.id] && !currentPhoto.url : false;
 
   const goToPrevious = () => {
     setCurrentIndex((prev) => (prev > 0 ? prev - 1 : photos.length - 1));
@@ -1002,8 +846,7 @@ function ClusterPopup({ photos, user }: { photos: Photo[]; user: FirebaseUser | 
     setCurrentIndex((prev) => (prev < photos.length - 1 ? prev + 1 : 0));
   };
 
-  const currentImageUrl = imageUrls[currentPhoto.id];
-  const isLoading = loading[currentPhoto.id];
+  const currentImageUrl = currentPhoto ? (imageUrls[currentPhoto.id] ?? currentPhoto.url) : null;
 
   return (
     <Popup maxWidth={300} className="cluster-popup">
@@ -1071,7 +914,7 @@ function ClusterPopup({ photos, user }: { photos: Photo[]; user: FirebaseUser | 
   );
 }
 
-function PhotoPopup({ photo }: { photo: Photo; user: FirebaseUser | null }) {
+function PhotoPopup({ photo }: { photo: Photo; user: User | null }) {
   const imageUrl = photo.url ?? null;
 
   return (
@@ -1105,66 +948,85 @@ function MapController({ center, zoom }: { center: [number, number]; zoom?: numb
   return null;
 }
 
-export default function Map({ user, locations, photos = [], friendLocations = [], onLocationUpdate, focusLocation, onPendingLocationsChange }: MapProps) {
+export interface MapControlsHandle {
+  zoomIn: () => void;
+  zoomOut: () => void;
+  flyToCurrentLocation: () => void;
+}
+
+function MapControlsBridge({ controlRef }: { controlRef: React.RefObject<MapControlsHandle | null> }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!controlRef || typeof controlRef === "function") return;
+    (controlRef as React.MutableRefObject<MapControlsHandle | null>).current = {
+      zoomIn: () => map.zoomIn(),
+      zoomOut: () => map.zoomOut(),
+      flyToCurrentLocation: () => {
+        if (typeof navigator !== "undefined" && navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => map.flyTo([pos.coords.latitude, pos.coords.longitude], Math.max(map.getZoom(), 14)),
+            () => {}
+          );
+        }
+      },
+    };
+    return () => {
+      if (controlRef && typeof controlRef !== "function") (controlRef as React.MutableRefObject<MapControlsHandle | null>).current = null;
+    };
+  }, [map, controlRef]);
+  return null;
+}
+
+export interface MapHandle extends MapTrackingHandle, MapControlsHandle {}
+
+function getInitials(displayName: string): string {
+  const name = (displayName || "").trim();
+  if (!name) return "?";
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase().slice(0, 2);
+  }
+  return name.slice(0, 2).toUpperCase();
+}
+
+export default forwardRef<MapHandle, MapProps>(function Map(
+  { user, locations, photos = [], friendLocations = [], onLocationUpdate, focusLocation, onPendingLocationsChange, onTrackingChange, onLocationSaved },
+  ref
+) {
+  const trackerRef = useRef<MapTrackingHandle | null>(null);
+  const mapControlsRef = useRef<MapControlsHandle | null>(null);
+
+  useImperativeHandle(ref, () => ({
+    toggleTracking: () => trackerRef.current?.toggleTracking(),
+    get isTracking() { return trackerRef.current?.isTracking ?? false; },
+    get isRequesting() { return trackerRef.current?.isRequesting ?? false; },
+    get error() { return trackerRef.current?.error ?? null; },
+    get permissionStatus() { return trackerRef.current?.permissionStatus ?? null; },
+    get currentLocation() { return trackerRef.current?.currentLocation ?? null; },
+    zoomIn: () => mapControlsRef.current?.zoomIn(),
+    zoomOut: () => mapControlsRef.current?.zoomOut(),
+    flyToCurrentLocation: () => mapControlsRef.current?.flyToCurrentLocation(),
+  }), []);
+
   const [mapCenter, setMapCenter] = useState<[number, number]>([51.505, -0.09]); // Default to London
   const [zoomLevel, setZoomLevel] = useState<number>(13);
   const [viewportThreshold, setViewportThreshold] = useState<number>(0.0004); // Default threshold
-  const hasInitializedCenterRef = useRef(false);
-  const friendColorMap = useMemo(() => {
-    const palette = [
-      "#22c55e",
-      "#3b82f6",
-      "#eab308",
-      "#ec4899",
-      "#8b5cf6",
-      "#f97316",
-      "#14b8a6",
-      "#f43f5e",
-    ];
-    const map: Record<string, string> = {};
-    friendLocations.forEach((f, index) => {
-      const existing = map[f.friend_id];
-      if (!existing) {
-        map[f.friend_id] = palette[index % palette.length];
-      }
-    });
-    return map;
-  }, [friendLocations]);
-
-  // Ensure locations used for map paths are in chronological order (oldest → newest),
-  // even if the caller provides them in a different order (e.g. newest first for the list).
-  const sortedLocations = useMemo(
-    () =>
-      [...locations].sort(
-        (a, b) =>
-          new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-      ),
-    [locations]
-  );
 
   useEffect(() => {
-    // Only determine the initial map center once.
-    if (hasInitializedCenterRef.current) return;
-
-    if (sortedLocations.length > 0) {
-      const lastLocation = sortedLocations[sortedLocations.length - 1];
-      setMapCenter([lastLocation.lat, lastLocation.lng]);
-      hasInitializedCenterRef.current = true;
-      return;
-    }
-
-    if (navigator.geolocation) {
+    if (navigator.geolocation && locations.length === 0) {
       navigator.geolocation.getCurrentPosition(
         (position) => {
           setMapCenter([position.coords.latitude, position.coords.longitude]);
-          hasInitializedCenterRef.current = true;
         },
         () => {
-          // Use default center if geolocation fails; leave initialized as false
+          // Use default center if geolocation fails
         }
       );
+    } else if (locations.length > 0) {
+      const lastLocation = locations[locations.length - 1];
+      setMapCenter([lastLocation.lat, lastLocation.lng]);
     }
-  }, [sortedLocations]);
+  }, [locations]);
 
   // Focus on photo location when provided
   useEffect(() => {
@@ -1215,13 +1077,13 @@ export default function Map({ user, locations, photos = [], friendLocations = []
 
   // Filter out locations that fall within photo clusters
   const visibleLocations = useMemo((): Location[] => {
-    if (photoGroups.length === 0) return sortedLocations;
+    if (photoGroups.length === 0) return locations;
     
     const threshold = Math.max(viewportThreshold, 0.00001);
     const excludedLocations = new Set<string>();
     
     // Check each location against each photo cluster
-    sortedLocations.forEach((location, index) => {
+    locations.forEach((location, index) => {
       photoGroups.forEach((group) => {
         // For clusters, check distance from location to cluster center
         if (group.photos.length > 1) {
@@ -1250,8 +1112,8 @@ export default function Map({ user, locations, photos = [], friendLocations = []
       });
     });
     
-    return sortedLocations.filter((_, index) => !excludedLocations.has(`location-${index}`));
-  }, [sortedLocations, photoGroups, viewportThreshold]);
+    return locations.filter((_, index) => !excludedLocations.has(`location-${index}`));
+  }, [locations, photoGroups, viewportThreshold]);
 
   // Create sequential timeline connections between events (photos and locations)
   const timelineConnections = useMemo(() => {
@@ -1287,7 +1149,7 @@ export default function Map({ user, locations, photos = [], friendLocations = []
     });
     
     // Add locations to timeline
-    sortedLocations.forEach((location) => {
+    locations.forEach((location) => {
       events.push({
         position: [location.lat, location.lng],
         timestamp: new Date(location.timestamp).getTime(),
@@ -1309,53 +1171,12 @@ export default function Map({ user, locations, photos = [], friendLocations = []
     console.log(`[Timeline] Created ${connections.length} sequential connections from ${events.length} events`);
     
     return connections;
-  }, [photoGroups, sortedLocations]);
+  }, [photoGroups, locations]);
 
   // Use visibleLocations for path coordinates (calculated after filtering)
   const pathCoordinates: [number, number][] = useMemo(() => {
     return visibleLocations.map((loc) => [loc.lat, loc.lng]);
   }, [visibleLocations]);
-
-  const handleLocateMe = useCallback(() => {
-    // Prefer fresh device location; fall back to last known tracked location.
-    const recenter = (lat: number, lng: number) => {
-      setMapCenter([lat, lng]);
-    };
-
-    if (isNativePlatform()) {
-      Geolocation.getCurrentPosition({
-        enableHighAccuracy: true,
-        timeout: isIOSSafari() ? 15000 : 10000,
-      })
-        .then((pos) => {
-          recenter(pos.coords.latitude, pos.coords.longitude);
-        })
-        .catch(() => {
-          if (sortedLocations.length > 0) {
-            const last = sortedLocations[sortedLocations.length - 1];
-            recenter(last.lat, last.lng);
-          }
-        });
-      return;
-    }
-
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          recenter(position.coords.latitude, position.coords.longitude);
-        },
-        () => {
-          if (sortedLocations.length > 0) {
-            const last = sortedLocations[sortedLocations.length - 1];
-            recenter(last.lat, last.lng);
-          }
-        }
-      );
-    } else if (sortedLocations.length > 0) {
-      const last = sortedLocations[sortedLocations.length - 1];
-      recenter(last.lat, last.lng);
-    }
-  }, [sortedLocations]);
 
   return (
     <div className="w-full h-full relative">
@@ -1368,11 +1189,9 @@ export default function Map({ user, locations, photos = [], friendLocations = []
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          updateWhenIdle={true}
-          updateWhenZooming={false}
-          keepBuffer={4}
         />
         <MapController center={mapCenter} zoom={focusLocation ? 15 : undefined} />
+        <MapControlsBridge controlRef={mapControlsRef} />
         <ZoomTracker onZoomChange={setZoomLevel} />
         <ViewportTracker onThresholdChange={setViewportThreshold} />
         
@@ -1455,51 +1274,35 @@ export default function Map({ user, locations, photos = [], friendLocations = []
           />
         )}
 
-        {/* Friends' latest shared locations */}
-        {friendLocations.map((friend) => (
+        {/* Friend locations (when they share with you) */}
+        {friendLocations.map((fl) => (
           <Marker
-            key={`friend-${friend.friend_id}`}
-            position={[friend.latitude, friend.longitude]}
-            icon={createFriendIcon(friendColorMap[friend.friend_id] ?? "#22c55e")}
+            key={fl.user_id}
+            position={[fl.lat, fl.lng]}
+            icon={createFriendLocationIcon(getInitials(fl.display_name))}
           >
             <Popup>
-              <div className="text-sm">
-                <p className="font-semibold text-gray-900 dark:text-gray-100">
-                  {friend.friend_email}
-                </p>
-                <p className="text-xs text-gray-500 dark:text-gray-400">
-                  Last seen at {new Date(friend.timestamp).toLocaleString()}
-                </p>
-              </div>
+              <span className="font-semibold">{fl.display_name || "Friend"}</span>
+              {fl.wait_time != null && fl.wait_time > 0 && (
+                <span className="block text-sm text-muted-foreground">
+                  Wait: {Math.floor(fl.wait_time / 60)} min
+                </span>
+              )}
             </Popup>
           </Marker>
         ))}
       </MapContainer>
-      <button
-        type="button"
-        onClick={handleLocateMe}
-        className="absolute bottom-4 right-4 z-[1000] flex items-center justify-center w-10 h-10 rounded-full bg-white dark:bg-zinc-900 shadow-lg border border-gray-200 dark:border-zinc-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
-        aria-label="Recenter map to your location"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 24 24"
-          className="w-5 h-5"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <circle cx="12" cy="12" r="3" />
-          <path d="M12 2v3" />
-          <path d="M12 19v3" />
-          <path d="M4 12H2" />
-          <path d="M22 12h-2" />
-        </svg>
-      </button>
-      {user && <LocationTracker user={user} onLocationUpdate={onLocationUpdate} onPendingLocationsChange={onPendingLocationsChange} />}
+      {user && (
+        <LocationTracker
+          ref={trackerRef}
+          user={user}
+          onLocationUpdate={onLocationUpdate}
+          onPendingLocationsChange={onPendingLocationsChange}
+          onTrackingChange={onTrackingChange}
+          onLocationSaved={onLocationSaved}
+        />
+      )}
     </div>
   );
-}
+});
 
