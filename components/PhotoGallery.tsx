@@ -1,40 +1,17 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { Capacitor } from "@capacitor/core";
 import { Camera } from "@capacitor/camera";
-import type { User as FirebaseUser } from "firebase/auth";
+import type { User } from "@/lib/types";
 import exifr from "exifr";
 import { compressImage } from "@/lib/imageCompression";
 import { isNativePlatform } from "@/lib/capacitor";
-import { createClient } from "@/lib/firebase/client";
-import { addPhotoMetadata, getPhotoMetadataForUser, deletePhotoMetadata } from "@/lib/firebase/photos";
 import {
   addPendingPhoto,
   getPendingPhotosForUser,
   deletePendingPhoto,
 } from "@/lib/localStore";
-import {
-  addLocalPhoto,
-  getAllLocalPhotosForUser,
-  getLocalPhotoUrl,
-  deleteLocalPhoto,
-  openPhotoInViewer,
-  type LocalPhotoRecord,
-} from "@/lib/localPhotoStorage";
-
-/** Convert EXIF DMS array [deg, min, sec] to decimal degrees. Ref is e.g. 'N'/'S', 'E'/'W'. */
-function dmsToDecimal(
-  dms: number[] | { [key: number]: number },
-  ref?: string
-): number | null {
-  const arr = Array.isArray(dms) ? dms : [dms[0], dms[1], dms[2]];
-  if (!arr.length || arr.some((n) => n == null || isNaN(Number(n)))) return null;
-  const [d = 0, m = 0, s = 0] = arr.map(Number);
-  let decimal = d + m / 60 + s / 3600;
-  if (ref === "S" || ref === "W") decimal = -decimal;
-  return decimal;
-}
 
 interface Photo {
   id: string;
@@ -44,12 +21,10 @@ interface Photo {
   longitude: number | null;
   timestamp: string;
   url?: string;
-  /** When set, photo is from local storage (IndexedDB/iOS); can use openPhotoInViewer on iOS */
-  localRecord?: LocalPhotoRecord;
 }
 
 interface PhotoGalleryProps {
-  user: FirebaseUser | null;
+  user: User | null;
   onPhotoClick?: (photo: Photo) => void;
   onPhotosUpdate?: () => void;
 }
@@ -68,48 +43,18 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pendingUrlsRef = useRef<Map<string, string>>(new Map());
-  const blobUrlsRef = useRef<Map<string, string>>(new Map());
-
-  const db = useMemo(() => (typeof window !== "undefined" ? createClient().db : null), []);
 
   const fetchPhotos = useCallback(async () => {
     if (!user) {
       setPhotos([]);
       return;
     }
-
     setLoading(true);
     try {
-      const [localRecords, pendingList, firestorePhotos] = await Promise.all([
-        getAllLocalPhotosForUser(user.uid),
-        getPendingPhotosForUser(user.uid),
-        db ? getPhotoMetadataForUser(db, user.uid) : Promise.resolve([]),
-      ]);
-
-      // Revoke previous pending and local blob URLs to avoid leaks
+      const pendingList = await getPendingPhotosForUser(user.id);
       pendingUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       pendingUrlsRef.current.clear();
-      blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      blobUrlsRef.current.clear();
-
-      const localPhotos: Photo[] = await Promise.all(
-        localRecords.map(async (rec) => {
-          const url = await getLocalPhotoUrl(rec);
-          blobUrlsRef.current.set(rec.id, url);
-          return {
-            id: rec.id,
-            user_id: rec.user_id,
-            storage_path: "",
-            latitude: rec.latitude,
-            longitude: rec.longitude,
-            timestamp: rec.timestamp,
-            url,
-            localRecord: rec,
-          };
-        })
-      );
-
-      const pendingPhotos: Photo[] = pendingList.map((p) => {
+      const list: Photo[] = pendingList.map((p) => {
         const url = URL.createObjectURL(p.blob);
         pendingUrlsRef.current.set(p.id, url);
         return {
@@ -122,31 +67,15 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           url,
         };
       });
-
-      const localAndPendingIds = new Set([...localPhotos.map((p) => p.id), ...pendingPhotos.map((p) => p.id)]);
-      const firestoreOnlyPhotos: Photo[] = firestorePhotos
-        .filter((m) => !localAndPendingIds.has(m.id))
-        .map((m) => ({
-          id: m.id,
-          user_id: m.user_id,
-          storage_path: "",
-          latitude: m.latitude,
-          longitude: m.longitude,
-          timestamp: m.timestamp,
-          url: undefined,
-        }));
-
-      const merged = [...pendingPhotos, ...localPhotos, ...firestoreOnlyPhotos].sort(
-        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-      ) as Photo[];
-      setPhotos(merged);
-    } catch (error) {
-      console.error("Error fetching photos:", error);
+      list.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      setPhotos(list);
+    } catch (err) {
+      console.error("Error fetching photos:", err);
       setError("Failed to load photos");
     } finally {
       setLoading(false);
     }
-  }, [user, db]);
+  }, [user]);
 
   useEffect(() => {
     if (user) {
@@ -154,66 +83,61 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
     }
   }, [user, fetchPhotos]);
 
-  const extractExifData = useCallback(async (file: File): Promise<{
-    latitude?: number;
-    longitude?: number;
+  const extractExifData = useCallback(async (file: File): Promise<{ 
+    latitude?: number; 
+    longitude?: number; 
     timestamp?: string;
   }> => {
-    const result: { latitude?: number; longitude?: number; timestamp?: string } = {};
     try {
+      // Extract EXIF data including GPS coordinates and date/time
       const exifData = await exifr.parse(file, {
         gps: true,
         exif: true,
       });
-
-      if (!exifData) return result;
-
-      // GPS: try normalized lat/long first, then raw DMS
-      let lat = exifData.latitude ?? exifData.GPSLatitude ?? exifData.Latitude;
-      let lng = exifData.longitude ?? exifData.GPSLongitude ?? exifData.Longitude;
-      if (typeof lat === "number" && typeof lng === "number") {
-        result.latitude = lat;
-        result.longitude = lng;
-      } else if (Array.isArray(lat) && Array.isArray(lng)) {
-        const latNum = dmsToDecimal(lat, exifData.GPSLatitudeRef ?? exifData.latitudeRef);
-        const lngNum = dmsToDecimal(lng, exifData.GPSLongitudeRef ?? exifData.longitudeRef);
-        if (latNum != null && lngNum != null) {
-          result.latitude = latNum;
-          result.longitude = lngNum;
-        }
+      
+      const result: { latitude?: number; longitude?: number; timestamp?: string } = {};
+      
+      // Extract GPS coordinates
+      if (exifData && exifData.latitude && exifData.longitude) {
+        result.latitude = exifData.latitude;
+        result.longitude = exifData.longitude;
       }
-
-      // Date/time: try all common EXIF date tags
-      const dateTimeOriginal =
-        exifData.DateTimeOriginal ??
-        exifData.DateTime ??
-        exifData.CreateDate ??
-        exifData.ModifyDate ??
-        exifData.SubSecTimeOriginal;
+      
+      // Extract date/time when photo was taken
+      // Try different EXIF date fields (different cameras use different fields)
+      const dateTimeOriginal = exifData?.DateTimeOriginal || exifData?.DateTime || exifData?.CreateDate;
+      
       if (dateTimeOriginal) {
         let photoDate: Date;
-        if (typeof dateTimeOriginal === "string") {
-          const dateStr = dateTimeOriginal.replace(/(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3");
+        
+        // Handle different date formats
+        if (typeof dateTimeOriginal === 'string') {
+          // EXIF date format is typically "YYYY:MM:DD HH:MM:SS"
+          // Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS" for Date parsing
+          const dateStr = dateTimeOriginal.replace(/(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
           photoDate = new Date(dateStr);
         } else if (dateTimeOriginal instanceof Date) {
           photoDate = dateTimeOriginal;
         } else {
+          // Try to parse as number (Unix timestamp)
           photoDate = new Date(dateTimeOriginal);
         }
-        if (
-          !isNaN(photoDate.getTime()) &&
-          photoDate.getTime() <= Date.now() &&
-          photoDate.getTime() > new Date("1900-01-01").getTime()
-        ) {
+        
+        // Validate the date is reasonable (not invalid, not in the future, not too old)
+        if (!isNaN(photoDate.getTime()) && 
+            photoDate.getTime() <= Date.now() && 
+            photoDate.getTime() > new Date('1900-01-01').getTime()) {
           result.timestamp = photoDate.toISOString();
         }
       }
-
+      
       return result;
     } catch (error) {
-      console.warn("Could not extract EXIF data:", error);
+      // EXIF extraction failed, continue without EXIF data
+      console.log("Could not extract EXIF data:", error);
     }
-    return result;
+    
+    return {};
   }, []);
 
   const uploadPhoto = useCallback(
@@ -228,16 +152,12 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       }
 
       try {
-        if (!user) {
-          throw new Error("User not authenticated");
-        }
-
         let finalLatitude: number | undefined;
         let finalLongitude: number | undefined;
         let photoTimestamp: string | undefined;
 
         const exifData = await extractExifData(file);
-        if (exifData.latitude != null && exifData.longitude != null) {
+        if (exifData.latitude && exifData.longitude) {
           finalLatitude = exifData.latitude;
           finalLongitude = exifData.longitude;
         }
@@ -245,35 +165,14 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           photoTimestamp = exifData.timestamp;
         }
 
-        // If no GPS in EXIF (e.g. camera capture, stripped file), use device position so photo appears on map
-        if ((finalLatitude == null || finalLongitude == null) && typeof navigator !== "undefined" && navigator.geolocation) {
-          try {
-            const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-              navigator.geolocation.getCurrentPosition(resolve, reject, {
-                enableHighAccuracy: true,
-                timeout: 8000,
-                maximumAge: 60000,
-              });
-            });
-            if (pos?.coords) {
-              finalLatitude = finalLatitude ?? pos.coords.latitude;
-              finalLongitude = finalLongitude ?? pos.coords.longitude;
-            }
-          } catch (e) {
-            console.warn("Could not get device position for photo:", e);
-          }
-        }
-
         if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 10 }));
 
-        // Compress locally first (before storing and uploading)
         const compressedFile = await compressImage(file);
 
-        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 30 }));
+        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 50 }));
 
-        // Store locally first so it appears immediately
         const pending = await addPendingPhoto({
-          user_id: user.uid,
+          user_id: user.id,
           latitude: finalLatitude ?? null,
           longitude: finalLongitude ?? null,
           timestamp: photoTimestamp ?? new Date().toISOString(),
@@ -296,53 +195,8 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
           ...prev,
         ]);
 
-        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 50 }));
-
+        if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 100 }));
         onPhotosUpdate?.();
-
-        // Persist to local storage (IndexedDB / iOS Filesystem) and Firestore metadata in background
-        (async () => {
-          try {
-            if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 70 }));
-
-            const rec = await addLocalPhoto(user.uid, compressedFile, {
-              latitude: finalLatitude ?? null,
-              longitude: finalLongitude ?? null,
-              timestamp: photoTimestamp ?? pending.timestamp,
-            });
-
-            if (db) {
-              await addPhotoMetadata(db, user.uid, {
-                id: rec.id,
-                local_name: rec.id,
-                latitude: rec.latitude,
-                longitude: rec.longitude,
-                timestamp: rec.timestamp,
-                created_at: rec.created_at,
-              });
-            }
-
-            if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 100 }));
-
-            const urlToRevoke = pendingUrlsRef.current.get(pending.id);
-            if (urlToRevoke) {
-              URL.revokeObjectURL(urlToRevoke);
-              pendingUrlsRef.current.delete(pending.id);
-            }
-            await deletePendingPhoto(pending.id);
-            await fetchPhotos();
-            onPhotosUpdate?.();
-          } catch (err) {
-            console.error("Background local photo save failed:", err);
-            if (fileId) {
-              setUploadProgress((prev) => {
-                const next = { ...prev };
-                delete next[fileId];
-                return next;
-              });
-            }
-          }
-        })();
       } catch (error: unknown) {
         console.error("Error uploading photo:", error);
         if (fileId) {
@@ -355,7 +209,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         throw error;
       }
     },
-    [user, db, extractExifData, fetchPhotos, onPhotosUpdate]
+    [user, extractExifData, onPhotosUpdate]
   );
 
   const handleFileSelect = useCallback(
@@ -535,23 +389,17 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       return;
     }
 
-    if (photo.user_id !== user.uid) {
+    if (photo.user_id !== user.id) {
       setError("You don't have permission to download this photo");
       return;
     }
 
-    const downloadUrl = photo.url;
-    if (!downloadUrl) {
-      setError("Photo not available");
+    if (!photo.url) {
+      setError("Photo not available to download");
       return;
     }
-
     try {
-      const response = await fetch(downloadUrl);
-      if (!response.ok) {
-        setError("Failed to download photo");
-        return;
-      }
+      const response = await fetch(photo.url);
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -561,26 +409,16 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(url);
-
       if (navigator.share && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
         try {
           const file = new File([blob], `photo-${photo.id}.jpg`, { type: "image/jpeg" });
           await navigator.share({ files: [file], title: "Travel Photo" });
         } catch {
-          // Share API failed, download already happened
+          // Share failed, download already happened
         }
       }
-    } catch (error) {
-      console.error("Error downloading photo:", error);
+    } catch (e) {
       setError("Failed to download photo");
-    }
-  }, []);
-
-  const viewPhotoInViewer = useCallback(async (photo: Photo) => {
-    if (photo.localRecord) {
-      await openPhotoInViewer(photo.localRecord);
-    } else if (photo.url) {
-      window.open(photo.url, "_blank");
     }
   }, []);
 
@@ -591,47 +429,23 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         return;
       }
 
-      if (photo.user_id !== user.uid) {
+      if (photo.user_id !== user.id) {
         setError("You don't have permission to delete this photo");
         return;
       }
 
       if (!confirm("Are you sure you want to delete this photo?")) return;
 
-      const isPending = !photo.localRecord && !!photo.url;
-      if (isPending) {
-        const urlToRevoke = pendingUrlsRef.current.get(photo.id);
-        if (urlToRevoke) {
-          URL.revokeObjectURL(urlToRevoke);
-          pendingUrlsRef.current.delete(photo.id);
-        }
-        await deletePendingPhoto(photo.id);
-        setPhotos((prev) => prev.filter((p) => p.id !== photo.id));
-        if (onPhotosUpdate) onPhotosUpdate();
-        return;
+      const urlToRevoke = pendingUrlsRef.current.get(photo.id);
+      if (urlToRevoke) {
+        URL.revokeObjectURL(urlToRevoke);
+        pendingUrlsRef.current.delete(photo.id);
       }
-
-      setPhotos((prevPhotos) => prevPhotos.filter((p) => p.id !== photo.id));
-      try {
-        if (photo.localRecord) {
-          await deleteLocalPhoto(photo.id);
-          const urlToRevoke = blobUrlsRef.current.get(photo.id);
-          if (urlToRevoke) {
-            URL.revokeObjectURL(urlToRevoke);
-            blobUrlsRef.current.delete(photo.id);
-          }
-        }
-        if (db && (photo.localRecord || photo.url === undefined)) {
-          await deletePhotoMetadata(db, photo.id);
-        }
-        if (onPhotosUpdate) onPhotosUpdate();
-      } catch (error) {
-        console.error("Error deleting photo:", error);
-        setError("Failed to delete photo");
-        await fetchPhotos();
-      }
+      await deletePendingPhoto(photo.id);
+      setPhotos((prev) => prev.filter((p) => p.id !== photo.id));
+      if (onPhotosUpdate) onPhotosUpdate();
     },
-    [user, db, fetchPhotos, onPhotosUpdate]
+    [user, onPhotosUpdate]
   );
 
   const deleteSelectedPhotos = useCallback(
@@ -639,7 +453,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       if (!user || selectedPhotos.size === 0) return;
 
       const photosToDelete = photos.filter((p) => selectedPhotos.has(p.id));
-      const invalidPhotos = photosToDelete.filter((p) => p.user_id !== user.uid);
+      const invalidPhotos = photosToDelete.filter((p) => p.user_id !== user.id);
       if (invalidPhotos.length > 0) {
         setError("Some photos cannot be deleted");
         return;
@@ -648,49 +462,19 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       if (!confirm(`Are you sure you want to delete ${selectedPhotos.size} photo(s)?`)) return;
 
       setPhotos((prevPhotos) => prevPhotos.filter((p) => !selectedPhotos.has(p.id)));
-
-      try {
-        await Promise.all(
-          photosToDelete
-            .filter((p) => p.localRecord)
-            .map((photo) => deleteLocalPhoto(photo.id))
-        );
-        await Promise.all(
-          photosToDelete
-            .filter((p) => !p.localRecord)
-            .map(async (p) => {
-              const urlToRevoke = pendingUrlsRef.current.get(p.id);
-              if (urlToRevoke) {
-                URL.revokeObjectURL(urlToRevoke);
-                pendingUrlsRef.current.delete(p.id);
-              }
-              await deletePendingPhoto(p.id);
-            })
-        );
-        if (db) {
-          await Promise.all(
-            photosToDelete
-              .filter((p) => p.localRecord || p.url === undefined)
-              .map((p) => deletePhotoMetadata(db, p.id))
-          );
+      for (const p of photosToDelete) {
+        const urlToRevoke = pendingUrlsRef.current.get(p.id);
+        if (urlToRevoke) {
+          URL.revokeObjectURL(urlToRevoke);
+          pendingUrlsRef.current.delete(p.id);
         }
-        photosToDelete.forEach((p) => {
-          const u = blobUrlsRef.current.get(p.id);
-          if (u) {
-            URL.revokeObjectURL(u);
-            blobUrlsRef.current.delete(p.id);
-          }
-        });
-        setSelectedPhotos(new Set());
-        setSelectionMode(false);
-        if (onPhotosUpdate) onPhotosUpdate();
-      } catch (error) {
-        console.error("Error deleting photos:", error);
-        setError("Failed to delete some photos");
-        await fetchPhotos();
+        await deletePendingPhoto(p.id);
       }
+      setSelectedPhotos(new Set());
+      setSelectionMode(false);
+      if (onPhotosUpdate) onPhotosUpdate();
     },
-    [user, selectedPhotos, photos, onPhotosUpdate, fetchPhotos]
+    [user, selectedPhotos, photos, onPhotosUpdate]
   );
 
   const togglePhotoSelection = useCallback((photoId: string) => {
@@ -902,13 +686,8 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
                   }}
                 />
               ) : (
-                <div className="w-full h-full flex flex-col items-center justify-center p-2">
-                  <p className="text-gray-400 text-sm text-center">
-                    {photo.localRecord ? "Loading..." : "Not on this device"}
-                  </p>
-                  {!photo.localRecord && photo.latitude != null && photo.longitude != null && (
-                    <p className="text-gray-500 text-xs mt-1">Location saved</p>
-                  )}
+                <div className="w-full h-full flex items-center justify-center">
+                  <p className="text-gray-400 text-sm">Loading...</p>
                 </div>
               )}
               {!selectionMode && (
@@ -925,18 +704,6 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
                       title="Show on Map"
                     >
                       Map
-                    </button>
-                  )}
-                  {isNativePlatform() && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        viewPhotoInViewer(photo);
-                      }}
-                      className="px-3 py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-md text-sm"
-                      title="Open in system viewer"
-                    >
-                      View
                     </button>
                   )}
                   <button

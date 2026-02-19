@@ -122,7 +122,7 @@ The app uses Firestore collections with the following structure:
 - `share_location_with_friend` - Boolean indicating if location sharing is enabled
 - `created_at` - Firestore Timestamp
 
-Security rules are configured in `firestore.rules` to ensure users can only access their own data.
+Data is also stored locally in IndexedDB (pending locations and photos) for offline support. Security rules are configured in `firestore.rules` to ensure users can only access their own data.
 
 ## Building for Production
 
