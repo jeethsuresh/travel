@@ -10,6 +10,7 @@
     "build:firebase": "IS_NATIVE=1 next build --webpack && node scripts/copy-out-to-dist.cjs",
     "deploy": "npm run build:hosting && firebase deploy",
     "deploy:firebase": "npm run build:firebase && firebase deploy",
+    "firebase": "npm run build:firebase && firebase deploy",
     "start": "next start",
     "lint": "eslint",
     "setup:env": "cp .env.example .env 2>/dev/null || true",
