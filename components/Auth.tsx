@@ -1,30 +1,30 @@
 "use client";
 
-import { createClient } from "@/lib/supabase/client";
+import { createClient } from "@/lib/firebase/client";
 import { useEffect, useState } from "react";
-import type { User } from "@supabase/supabase-js";
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  User as FirebaseUser
+} from "firebase/auth";
 
 export default function Auth() {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [isSignUp, setIsSignUp] = useState(false);
-  const supabase = createClient();
+  const { auth } = createClient();
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data: { user } }) => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
       setUser(user);
     });
 
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-    });
-
-    return () => subscription.unsubscribe();
-  }, [supabase.auth]);
+    return () => unsubscribe();
+  }, [auth]);
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -32,18 +32,15 @@ export default function Auth() {
 
     try {
       if (isSignUp) {
-        const { error } = await supabase.auth.signUp({
-          email,
-          password,
-        });
-        if (error) throw error;
-        alert("Check your email for the confirmation link!");
+        const domain = email.split("@")[1]?.toLowerCase() ?? "";
+        if (domain === "localhost" || domain.startsWith("localhost:")) {
+          throw new Error("Please use a non-localhost email domain when signing up.");
+        }
+
+        await createUserWithEmailAndPassword(auth, email, password);
+        alert("Account created successfully! You are now signed in.");
       } else {
-        const { error } = await supabase.auth.signInWithPassword({
-          email,
-          password,
-        });
-        if (error) throw error;
+        await signInWithEmailAndPassword(auth, email, password);
       }
     } catch (error: any) {
       alert(error.message);
@@ -53,7 +50,7 @@ export default function Auth() {
   };
 
   const handleSignOut = async () => {
-    await supabase.auth.signOut();
+    await signOut(auth);
   };
 
   if (user) {
