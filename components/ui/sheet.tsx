@@ -3,6 +3,7 @@
 import * as React from "react";
 import * as SheetPrimitive from "@radix-ui/react-dialog";
 import { cva, type VariantProps } from "class-variance-authority";
+import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const Sheet = SheetPrimitive.Root;
@@ -31,12 +32,12 @@ const sheetVariants = cva(
   {
     variants: {
       side: {
-        top: "inset-x-0 top-0 border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
+        top: "inset-x-0 top-0 border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top pt-[max(1rem,calc(env(safe-area-inset-top,0px)+0.5rem))]",
         bottom:
-          "inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
-        left: "inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm",
+          "inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom pb-[max(1rem,calc(env(safe-area-inset-bottom,0px)+0.5rem))]",
+        left: "inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm pl-[max(0.75rem,env(safe-area-inset-left,0px))]",
         right:
-          "inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
+          "inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm pr-[max(0.75rem,env(safe-area-inset-right,0px))]",
       },
     },
     defaultVariants: {
@@ -47,24 +48,134 @@ const sheetVariants = cva(
 
 interface SheetContentProps
   extends React.ComponentPropsWithoutRef<typeof SheetPrimitive.Content>,
-    VariantProps<typeof sheetVariants> {}
+    VariantProps<typeof sheetVariants> {
+  onOpenChange?: (open: boolean) => void;
+}
 
 const SheetContent = React.forwardRef<
   React.ComponentRef<typeof SheetPrimitive.Content>,
   SheetContentProps
->(({ side = "right", className, children, ...props }, ref) => (
-  <SheetPortal>
-    <SheetOverlay />
-    <SheetPrimitive.Content
-      ref={ref}
-      className={cn(sheetVariants({ side }), className)}
-      data-slot="sheet-content"
-      {...props}
-    >
-      {children}
-    </SheetPrimitive.Content>
-  </SheetPortal>
-));
+>(({ side = "right", className, children, onOpenChange, ...props }, ref) => {
+  const contentRef = React.useRef<HTMLDivElement>(null);
+  const touchStartRef = React.useRef<{ x: number; y: number } | null>(null);
+  const touchStartTimeRef = React.useRef<number>(0);
+
+  // Determine close button position based on side
+  const closeButtonClasses = cn(
+    "absolute z-50 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary p-2 sheet-close-button",
+    side === "right" && "sheet-close-button-right",
+    side === "left" && "sheet-close-button-left",
+    side === "top" && "sheet-close-button-right",
+    side === "bottom" && "sheet-close-button-right"
+  );
+
+  // Handle swipe gestures for mobile
+  const handleTouchStart = React.useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+    touchStartTimeRef.current = Date.now();
+  }, []);
+
+  const handleTouchMove = React.useCallback((e: React.TouchEvent) => {
+    if (!touchStartRef.current || !contentRef.current) return;
+    
+    const touch = e.touches[0];
+    const deltaX = touch.clientX - touchStartRef.current.x;
+    const deltaY = touch.clientY - touchStartRef.current.y;
+    const absDeltaX = Math.abs(deltaX);
+    const absDeltaY = Math.abs(deltaY);
+
+    // Determine swipe direction based on sheet side
+    let shouldSwipe = false;
+    if (side === "right" && deltaX > 0 && absDeltaX > absDeltaY && absDeltaX > 50) {
+      shouldSwipe = true;
+    } else if (side === "left" && deltaX < 0 && absDeltaX > absDeltaY && absDeltaX > 50) {
+      shouldSwipe = true;
+    } else if (side === "bottom" && deltaY > 0 && absDeltaY > absDeltaX && absDeltaY > 50) {
+      shouldSwipe = true;
+    } else if (side === "top" && deltaY < 0 && absDeltaY > absDeltaX && absDeltaY > 50) {
+      shouldSwipe = true;
+    }
+
+    if (shouldSwipe) {
+      // Apply visual feedback during swipe
+      const translateX = side === "right" ? Math.max(0, deltaX) : side === "left" ? Math.min(0, deltaX) : 0;
+      const translateY = side === "bottom" ? Math.max(0, deltaY) : side === "top" ? Math.min(0, deltaY) : 0;
+      contentRef.current.style.transform = `translate(${translateX}px, ${translateY}px)`;
+      contentRef.current.style.transition = "none";
+    }
+  }, [side]);
+
+  const handleTouchEnd = React.useCallback((e: React.TouchEvent) => {
+    if (!touchStartRef.current || !contentRef.current) return;
+
+    const touch = e.changedTouches[0];
+    const deltaX = touch.clientX - touchStartRef.current.x;
+    const deltaY = touch.clientY - touchStartRef.current.y;
+    const absDeltaX = Math.abs(deltaX);
+    const absDeltaY = Math.abs(deltaY);
+    const duration = Date.now() - touchStartTimeRef.current;
+    const velocity = Math.sqrt(deltaX * deltaX + deltaY * deltaY) / duration;
+
+    // Reset transform
+    contentRef.current.style.transform = "";
+    contentRef.current.style.transition = "";
+
+    // Determine if swipe should close the sheet
+    let shouldClose = false;
+    const threshold = 100; // Minimum distance
+    const velocityThreshold = 0.3; // Minimum velocity (px/ms)
+
+    if (side === "right" && deltaX > threshold && absDeltaX > absDeltaY) {
+      shouldClose = true;
+    } else if (side === "right" && velocity > velocityThreshold && deltaX > 0 && absDeltaX > absDeltaY) {
+      shouldClose = true;
+    } else if (side === "left" && deltaX < -threshold && absDeltaX > absDeltaY) {
+      shouldClose = true;
+    } else if (side === "left" && velocity > velocityThreshold && deltaX < 0 && absDeltaX > absDeltaY) {
+      shouldClose = true;
+    } else if (side === "bottom" && deltaY > threshold && absDeltaY > absDeltaX) {
+      shouldClose = true;
+    } else if (side === "bottom" && velocity > velocityThreshold && deltaY > 0 && absDeltaY > absDeltaX) {
+      shouldClose = true;
+    } else if (side === "top" && deltaY < -threshold && absDeltaY > absDeltaX) {
+      shouldClose = true;
+    } else if (side === "top" && velocity > velocityThreshold && deltaY < 0 && absDeltaY > absDeltaX) {
+      shouldClose = true;
+    }
+
+    if (shouldClose && onOpenChange) {
+      onOpenChange(false);
+    }
+
+    touchStartRef.current = null;
+  }, [side, onOpenChange]);
+
+  // Combine refs
+  React.useImperativeHandle(ref, () => contentRef.current as any, []);
+  
+  return (
+    <SheetPortal>
+      <SheetOverlay />
+      <SheetPrimitive.Content
+        ref={contentRef}
+        className={cn(sheetVariants({ side }), className)}
+        data-slot="sheet-content"
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        {...props}
+      >
+        {/* Close button - always visible, positioned with safe area padding */}
+        <SheetPrimitive.Close className={closeButtonClasses}>
+          <X className="h-4 w-4" />
+          <span className="sr-only">Close</span>
+        </SheetPrimitive.Close>
+        {children}
+      </SheetPrimitive.Content>
+    </SheetPortal>
+  );
+});
 SheetContent.displayName = SheetPrimitive.Content.displayName;
 
 const SheetHeader = ({

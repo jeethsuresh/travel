@@ -137,6 +137,25 @@ The app can run as a native iOS app using Capacitor, with native geolocation and
 
 ### Build and run on iOS
 
+**Important: Environment Variables**
+
+Next.js replaces `NEXT_PUBLIC_*` environment variables at **build time** and embeds them in the JavaScript bundle. For Capacitor builds, ensure your `.env` file exists and contains all required Firebase variables before building:
+
+```bash
+# Verify your .env file exists and has all required variables
+cat .env
+```
+
+Required variables:
+- `NEXT_PUBLIC_FIREBASE_API_KEY`
+- `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`
+- `NEXT_PUBLIC_FIREBASE_PROJECT_ID`
+- `NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET`
+- `NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID`
+- `NEXT_PUBLIC_FIREBASE_APP_ID`
+
+If any are missing, the build will fail with a clear error message.
+
 1. **Build the web app for native** (static export):
 
    ```bash
@@ -148,6 +167,8 @@ The app can run as a native iOS app using Capacitor, with native geolocation and
    ```bash
    npm run build:native
    ```
+
+   The build process will verify all required environment variables are present.
 
 2. **Sync to iOS** (copies `out` into the native project):
 

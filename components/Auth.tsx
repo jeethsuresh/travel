@@ -25,26 +25,174 @@ export default function Auth({ user, onSignOut }: AuthProps) {
     e.preventDefault();
     setError(null);
     setLoading(true);
+      console.log("[Auth] handleSubmit called", { isSignUp, email });
     const auth = getFirebaseAuth();
+    console.log("[Auth] getFirebaseAuth() returned:", auth ? "Auth instance" : "null");
     if (!auth) {
-      setError("Firebase is not configured.");
+      const errorMsg = "Firebase is not configured. Please check your environment variables.";
+      console.error("[Auth]", errorMsg);
+      setError(errorMsg);
       setLoading(false);
       return;
     }
+    
+    // Log auth configuration for debugging
+    console.log("[Auth] Auth configuration:", {
+      currentUser: auth.currentUser?.uid || null,
+      app: auth.app.name,
+      config: {
+        apiKey: auth.app.options.apiKey ? `${auth.app.options.apiKey.substring(0, 10)}...` : "missing",
+        authDomain: auth.app.options.authDomain || "missing",
+        projectId: auth.app.options.projectId || "missing",
+      },
+    });
+    
+    // Track when the promise actually starts
+    const startTime = Date.now();
+    let progressInterval: NodeJS.Timeout | null = null;
+    
     try {
-      if (isSignUp) {
-        const domain = email.split("@")[1]?.toLowerCase() ?? "";
-        if (domain === "localhost" || domain.startsWith("localhost:")) {
-          throw new Error("Please use a non-localhost email domain when signing up.");
-        }
-        await createUserWithEmailAndPassword(auth, email, password);
-      } else {
-        await signInWithEmailAndPassword(auth, email, password);
+      // Add timeout wrapper to prevent infinite hanging
+      const authPromise = isSignUp
+        ? (async () => {
+            const domain = email.split("@")[1]?.toLowerCase() ?? "";
+            if (domain === "localhost" || domain.startsWith("localhost:")) {
+              throw new Error("Please use a non-localhost email domain when signing up.");
+            }
+            console.log("[Auth] Creating user with email:", email);
+            return await createUserWithEmailAndPassword(auth, email, password);
+          })()
+        : (async () => {
+            console.log("[Auth] Signing in with email:", email);
+            return await signInWithEmailAndPassword(auth, email, password);
+          })();
+
+      // Longer timeout for mobile networks (60 seconds)
+      const timeoutMs = 60000;
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error("Authentication timed out. This may be a network issue. Please check your internet connection and try again."));
+        }, timeoutMs);
+      });
+
+      console.log("[Auth] Waiting for auth operation...", { timeoutMs, isSignUp });
+      
+      // Wrap auth promise to track when it actually starts executing
+      const trackedAuthPromise = authPromise.then((result) => {
+        const elapsed = Date.now() - startTime;
+        console.log("[Auth] Auth operation completed successfully", { elapsedMs: elapsed });
+        return result;
+      }).catch((error) => {
+        const elapsed = Date.now() - startTime;
+        console.error("[Auth] Auth operation failed", { elapsedMs: elapsed, error });
+        throw error;
+      });
+      
+      // Log progress every 5 seconds
+      progressInterval = setInterval(() => {
+        const elapsed = Date.now() - startTime;
+        console.log("[Auth] Still waiting for auth...", { elapsedMs: elapsed, timeoutMs });
+      }, 5000);
+      
+      const userCredential = await Promise.race([trackedAuthPromise, timeoutPromise]) as Awaited<typeof authPromise>;
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
       }
+      console.log("[Auth] Auth operation successful:", userCredential.user.uid);
+      
+      // Clear loading immediately - the parent's onAuthStateChanged will update user prop
+      // which will cause this component to re-render and show the signed-in state
+      console.log("[Auth] Clearing loading state - auth state change should update parent");
+      setLoading(false);
     } catch (err: unknown) {
-      const message = err && typeof err === "object" && "message" in err ? String((err as { message: string }).message) : "Sign in failed";
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
+      }
+      console.error("[Auth] Auth error caught:", err);
+      console.error("[Auth] Error type:", typeof err);
+      console.error("[Auth] Error constructor:", err && typeof err === "object" && err.constructor?.name);
+      
+      // Log all properties of the error object
+      if (err && typeof err === "object") {
+        const errAny = err as any;
+        console.error("[Auth] Error properties:", {
+          code: errAny.code,
+          message: errAny.message,
+          name: errAny.name,
+          stack: errAny.stack,
+          customData: errAny.customData,
+          toString: String(err),
+          // Try to get all enumerable properties
+          keys: Object.keys(err),
+          entries: Object.entries(err),
+        });
+      }
+      
+      let message = "Sign in failed";
+      
+      // Handle Firebase error (has 'code' property)
+      // In Capacitor, errors might not serialize properly, so check directly
+      const errAny = err as any;
+      const errorCode = errAny?.code;
+      const errorMessage = errAny?.message;
+      
+      if (errorCode) {
+        const code = String(errorCode);
+        console.log("[Auth] Firebase error code:", code);
+        // Map Firebase error codes to user-friendly messages
+        if (code === "auth/user-not-found") {
+          message = "No account found with this email.";
+        } else if (code === "auth/wrong-password") {
+          message = "Incorrect password.";
+        } else if (code === "auth/invalid-credential") {
+          message = "Invalid email or password.";
+        } else if (code === "auth/email-already-in-use") {
+          message = "An account with this email already exists.";
+        } else if (code === "auth/weak-password") {
+          message = "Password is too weak. Please use at least 6 characters.";
+        } else if (code === "auth/invalid-email") {
+          message = "Invalid email address.";
+        } else if (code === "auth/network-request-failed") {
+          message = "Network error. Please check your internet connection and try again.";
+        } else if (code === "auth/too-many-requests") {
+          message = "Too many failed attempts. Please try again later.";
+        } else if (code === "auth/user-disabled") {
+          message = "This account has been disabled.";
+        } else {
+          message = errorMessage || `Error: ${code}`;
+        }
+      } else if (errorMessage) {
+        // Check if it's a timeout error
+        if (errorMessage.includes("timed out")) {
+          message = "Authentication is taking longer than expected. This may be due to:\n\n• Slow or unstable internet connection\n• Firebase service temporarily unavailable\n• Network restrictions\n\nPlease check your internet connection and try again.";
+        } else {
+          message = String(errorMessage);
+        }
+      } else if (err && typeof err === "object" && "message" in err) {
+        const errMsg = String((err as { message: string }).message);
+        if (errMsg.includes("timed out")) {
+          message = "Authentication is taking longer than expected. This may be due to:\n\n• Slow or unstable internet connection\n• Firebase service temporarily unavailable\n• Network restrictions\n\nPlease check your internet connection and try again.";
+        } else {
+          message = errMsg;
+        }
+      } else if (err) {
+        // Last resort: try to stringify or convert to string
+        try {
+          const str = String(err);
+          if (str !== "[object Object]") {
+            message = str;
+          } else {
+            message = "Authentication failed. Please check your internet connection and try again.";
+          }
+        } catch {
+          message = "Authentication failed. Please check your internet connection and try again.";
+        }
+      }
+      
+      console.error("[Auth] Final error message:", message);
       setError(message);
-    } finally {
       setLoading(false);
     }
   };
@@ -109,7 +257,7 @@ export default function Auth({ user, onSignOut }: AuthProps) {
           />
         </div>
         {error && (
-          <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+          <div className="text-sm text-red-600 dark:text-red-400 whitespace-pre-line">{error}</div>
         )}
         <button
           type="submit"
