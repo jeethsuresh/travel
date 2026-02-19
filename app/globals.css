@@ -47,6 +47,54 @@
   --radius-4xl: calc(var(--radius) + 16px);
 }
 
+/* Safe area padding for mobile controls */
+.safe-area-padding {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+/* Safe area utilities for mobile controls */
+.safe-area-top-left {
+  padding-top: max(2.5rem, calc(env(safe-area-inset-top, 0px) + 1rem));
+  padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+}
+
+.safe-area-top-right {
+  padding-top: max(2.5rem, calc(env(safe-area-inset-top, 0px) + 1rem));
+  padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+}
+
+/* Sheet close button positioning with safe areas */
+.sheet-close-button {
+  top: max(1rem, calc(env(safe-area-inset-top, 0px) + 1rem));
+}
+
+.sheet-close-button-right {
+  right: max(1rem, calc(env(safe-area-inset-right, 0px) + 1rem));
+}
+
+.sheet-close-button-left {
+  left: max(1rem, calc(env(safe-area-inset-left, 0px) + 1rem));
+}
+
+/* Ensure safe area insets are available (fallback for older browsers) */
+@supports (padding: max(0px)) {
+  .safe-area-top {
+    padding-top: max(2rem, calc(env(safe-area-inset-top, 0px) + 1rem));
+  }
+  .safe-area-bottom {
+    padding-bottom: max(1rem, calc(env(safe-area-inset-bottom, 0px) + 0.5rem));
+  }
+  .safe-area-left {
+    padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+  }
+  .safe-area-right {
+    padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+  }
+}
+
 /* Leaflet map container fixes */
 .leaflet-container {
   height: 100%;
