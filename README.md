@@ -2,7 +2,7 @@
 
 A Progressive Web App (PWA) built with Next.js that tracks and displays your location history over time. Features include:
 
-- 🔐 **Supabase Authentication** - Secure user login and signup
+- 🔐 **Firebase Authentication** - Secure user login and signup
 - 🗺️ **Interactive Map** - View your location history on an interactive map using Leaflet
 - 📍 **Location Tracking** - Real-time location tracking with start/stop controls
 - 📊 **Location History** - View and browse your past locations
@@ -11,7 +11,7 @@ A Progressive Web App (PWA) built with Next.js that tracks and displays your loc
 ## Prerequisites
 
 - Node.js 18+ and npm
-- A Supabase account and project
+- A Firebase account and project
 
 ## Setup Instructions
 
@@ -21,22 +21,35 @@ A Progressive Web App (PWA) built with Next.js that tracks and displays your loc
 npm install
 ```
 
-### 2. Set Up Supabase
+### 2. Set Up Firebase
 
-1. Create a new project at [supabase.com](https://supabase.com)
-2. Go to your project's SQL Editor
-3. Run the SQL script from `supabase/schema.sql` to create the `locations` table and set up Row Level Security policies
+1. Create a new project at [Firebase Console](https://console.firebase.google.com)
+2. Enable Authentication:
+   - Go to Authentication > Sign-in method
+   - Enable Email/Password authentication
+3. Create Firestore Database:
+   - Go to Firestore Database
+   - Create database in production mode
+   - Deploy security rules from `firestore.rules`
+4. Set up Storage:
+   - Go to Storage
+   - Get started with default settings
+   - Deploy storage rules from `storage.rules`
 
 ### 3. Configure Environment Variables
 
 Create a `.env.local` file in the root directory:
 
 ```env
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
+NEXT_PUBLIC_FIREBASE_API_KEY=your_firebase_api_key
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your_project_id.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=your_project_id
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=your_project_id.appspot.com
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=your_messaging_sender_id
+NEXT_PUBLIC_FIREBASE_APP_ID=your_app_id
 ```
 
-You can find these values in your Supabase project settings under API.
+You can find these values in your Firebase project settings under Project Settings > General > Your apps.
 
 ### 4. Run the Development Server
 
@@ -51,11 +64,11 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 ### Authentication
 - Sign up with email and password
 - Sign in to existing accounts
-- Secure session management with Supabase Auth
+- Secure session management with Firebase Auth
 
 ### Location Tracking
 - Click "Start Tracking" to begin recording your location
-- Location data is automatically saved to Supabase
+- Location data is automatically saved to Firestore
 - Click "Stop Tracking" to pause recording
 - Real-time location updates displayed on the map
 
@@ -72,16 +85,44 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ## Database Schema
 
-The app uses a single `locations` table with the following structure:
+The app uses Firestore collections with the following structure:
 
-- `id` - UUID primary key
-- `user_id` - Foreign key to auth.users
+### Locations Collection
+- `id` - Document ID (auto-generated)
+- `user_id` - User UID from Firebase Auth
 - `latitude` - Location latitude
 - `longitude` - Location longitude
-- `timestamp` - When the location was recorded
-- `created_at` - Record creation timestamp
+- `timestamp` - Firestore Timestamp when the location was recorded
+- `wait_time` - Time in seconds spent at this location
+- `created_at` - Firestore Timestamp for record creation
 
-Row Level Security (RLS) is enabled, ensuring users can only access their own location data.
+### Photos Collection
+- `id` - Document ID (auto-generated)
+- `user_id` - User UID from Firebase Auth
+- `storage_path` - Path to photo in Firebase Storage
+- `latitude` - Photo location latitude (optional)
+- `longitude` - Photo location longitude (optional)
+- `timestamp` - Firestore Timestamp when photo was taken
+- `created_at` - Firestore Timestamp for record creation
+
+### Friend Requests Collection
+- `id` - Document ID (auto-generated)
+- `requester_id` - User UID who sent the request
+- `requester_email` - Email of requester
+- `recipient_email` - Email of recipient
+- `status` - Request status: "pending", "accepted", or "rejected"
+- `created_at` - Firestore Timestamp
+- `responded_at` - Firestore Timestamp when responded (optional)
+
+### Friendships Collection
+- `id` - Document ID (auto-generated)
+- `user_id` - User UID
+- `friend_id` - Friend's user UID
+- `friend_email` - Friend's email
+- `share_location_with_friend` - Boolean indicating if location sharing is enabled
+- `created_at` - Firestore Timestamp
+
+Security rules are configured in `firestore.rules` to ensure users can only access their own data.
 
 ## Building for Production
 
@@ -92,7 +133,7 @@ npm start
 
 ## Native iOS App (Capacitor)
 
-The app can run as a native iOS app using Capacitor, with native geolocation and photo library access. Photos are picked from the device library, compressed locally, and uploaded once to Supabase for storage and web viewing (no redownloading on each open).
+The app can run as a native iOS app using Capacitor, with native geolocation and photo library access. Photos are picked from the device library, compressed locally, and uploaded once to Firebase Storage for storage and web viewing (no redownloading on each open).
 
 ### Build and run on iOS
 
@@ -147,7 +188,7 @@ The app is configured as a Progressive Web App. To install:
 - **Next.js 16** - React framework with App Router
 - **TypeScript** - Type safety
 - **Tailwind CSS** - Styling
-- **Supabase** - Authentication and database
+- **Firebase** - Authentication, Firestore database, and Storage
 - **Leaflet** - Interactive maps
 - **next-pwa** - PWA support
 

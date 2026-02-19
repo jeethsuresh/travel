@@ -4,9 +4,10 @@
  */
 
 const DB_NAME = "travel_local";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_LOCATIONS = "pending_locations";
 const STORE_PHOTOS = "pending_photos";
+const STORE_LOCAL_PHOTOS = "local_photos";
 const STORE_TIMELINE = "timeline_cache";
 
 export interface PendingLocation {
@@ -50,6 +51,9 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_PHOTOS)) {
         db.createObjectStore(STORE_PHOTOS, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(STORE_LOCAL_PHOTOS)) {
+        db.createObjectStore(STORE_LOCAL_PHOTOS, { keyPath: "id" });
       }
       if (!db.objectStoreNames.contains(STORE_TIMELINE)) {
         db.createObjectStore(STORE_TIMELINE, { keyPath: "key" });
@@ -316,3 +320,5 @@ export function setTimelineCacheSync(
     console.warn("Timeline cache write failed:", e);
   }
 }
+
+export { openDB, STORE_LOCAL_PHOTOS };

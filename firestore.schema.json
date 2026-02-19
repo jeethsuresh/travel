@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Firestore collections schema (reference only; Firestore does not enforce this)",
+  "description": "Field names and types for each collection. Used for documentation and optional validation.",
+  "collections": {
+    "locations": {
+      "description": "Location points synced from local pending queue",
+      "documentId": "auto",
+      "fields": {
+        "user_id": { "type": "string", "required": true },
+        "latitude": { "type": "number", "required": true },
+        "longitude": { "type": "number", "required": true },
+        "timestamp": { "type": "timestamp", "required": true },
+        "wait_time": { "type": "number", "required": false },
+        "created_at": { "type": "timestamp", "required": false }
+      }
+    },
+    "photos": {
+      "description": "Photo metadata only; images stored locally. Persists locations across app resets.",
+      "documentId": "same as local photo id",
+      "fields": {
+        "user_id": { "type": "string", "required": true },
+        "local_name": { "type": "string", "required": true },
+        "latitude": { "type": "number|null", "required": false },
+        "longitude": { "type": "number|null", "required": false },
+        "timestamp": { "type": "string", "required": true },
+        "created_at": { "type": "string", "required": true }
+      }
+    },
+    "friend_requests": {
+      "description": "Friend request from requester to recipient (by email)",
+      "documentId": "auto",
+      "fields": {
+        "requester_id": { "type": "string", "required": true },
+        "requester_email": { "type": "string", "required": true },
+        "recipient_email": { "type": "string", "required": true },
+        "status": { "type": "string", "required": true, "enum": ["pending", "accepted", "rejected"] },
+        "created_at": { "type": "timestamp", "required": false },
+        "responded_at": { "type": "timestamp", "required": false }
+      }
+    },
+    "friendships": {
+      "description": "Bidirectional friendship; two docs per pair (user_id/friend_id and friend_id/user_id)",
+      "documentId": "auto",
+      "fields": {
+        "user_id": { "type": "string", "required": true },
+        "friend_id": { "type": "string", "required": true },
+        "friend_email": { "type": "string", "required": true },
+        "share_location_with_friend": { "type": "boolean", "required": true },
+        "created_at": { "type": "timestamp", "required": false }
+      }
+    }
+  }
+}

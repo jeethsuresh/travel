@@ -1,0 +1,78 @@
+rules_version = '2';
+// Schema reference: firestore.schema.md and firestore.schema.json
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // Helpers: only authenticated users; only access where you are the owner.
+    // -------------------------------------------------------------------------
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Document is "owned" by the current user (user_id field).
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // -------------------------------------------------------------------------
+    // locations: each document has user_id. User may only access their own.
+    // -------------------------------------------------------------------------
+    match /locations/{locationId} {
+      allow read: if isOwner(resource.data.user_id);
+      allow create: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      allow update: if isOwner(resource.data.user_id) && request.resource.data.user_id == request.auth.uid;
+      allow delete: if isOwner(resource.data.user_id);
+    }
+
+    // -------------------------------------------------------------------------
+    // photos: each document has user_id. User may only access their own.
+    // -------------------------------------------------------------------------
+    match /photos/{photoId} {
+      allow read: if isOwner(resource.data.user_id);
+      allow create: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      allow update: if isOwner(resource.data.user_id) && request.resource.data.user_id == request.auth.uid;
+      allow delete: if isOwner(resource.data.user_id);
+    }
+
+    // -------------------------------------------------------------------------
+    // friend_requests: "own data" = requests you sent (requester) or received (recipient).
+    // -------------------------------------------------------------------------
+    match /friend_requests/{requestId} {
+      allow read: if isAuthenticated() && (
+        resource.data.requester_id == request.auth.uid ||
+        resource.data.recipient_email == request.auth.token.email
+      );
+      allow create: if isAuthenticated() &&
+        request.resource.data.requester_id == request.auth.uid &&
+        request.resource.data.requester_email == request.auth.token.email;
+      allow update: if isAuthenticated() &&
+        resource.data.recipient_email == request.auth.token.email &&
+        request.resource.data.recipient_email == request.auth.token.email;
+      allow delete: if isAuthenticated() && resource.data.requester_id == request.auth.uid;
+    }
+
+    // -------------------------------------------------------------------------
+    // friendships: "own data" = the row where user_id is the current user.
+    // Create may set user_id or friend_id to auth.uid (both rows when accepting).
+    // -------------------------------------------------------------------------
+    match /friendships/{friendshipId} {
+      allow read: if isAuthenticated() && resource.data.user_id == request.auth.uid;
+      allow create: if isAuthenticated() && (
+        request.resource.data.user_id == request.auth.uid ||
+        request.resource.data.friend_id == request.auth.uid
+      );
+      allow update: if isAuthenticated() &&
+        resource.data.user_id == request.auth.uid &&
+        request.resource.data.user_id == request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.user_id == request.auth.uid;
+    }
+
+    // -------------------------------------------------------------------------
+    // Default: deny any other collection or path.
+    // -------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

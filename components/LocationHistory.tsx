@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { createClient } from "@/lib/supabase/client";
-import type { User } from "@supabase/supabase-js";
+import { createClient } from "@/lib/firebase/client";
+import { collection, query, where, orderBy, limit, getDocs, Timestamp } from "firebase/firestore";
+import type { User as FirebaseUser } from "firebase/auth";
 import { getPendingLocationsForUser } from "@/lib/localStore";
 
 interface Location {
@@ -14,12 +15,18 @@ interface Location {
 }
 
 interface LocationHistoryProps {
-  user: User | null;
+  user: FirebaseUser | null;
   /** When provided, this list is shown (e.g. from parent so new locations appear without refetch). */
   locations?: Location[] | null;
   onLocationSelect?: (location: Location) => void;
   /** Callback to refetch locations (e.g. for Refresh button). */
   onRefresh?: () => void;
+  /** Whether there are more pages of locations to load. */
+  hasMore?: boolean;
+  /** Whether an additional page is currently being loaded. */
+  isLoadingMore?: boolean;
+  /** Called when the user clicks the "Load More" button to load the next page. */
+  onLoadMore?: () => void;
 }
 
 export default function LocationHistory({
@@ -27,10 +34,14 @@ export default function LocationHistory({
   locations: locationsProp,
   onLocationSelect,
   onRefresh,
+  hasMore,
+  isLoadingMore,
+  onLoadMore,
 }: LocationHistoryProps) {
   const [locationsState, setLocationsState] = useState<Location[]>([]);
   const [loading, setLoading] = useState(true);
-  const supabase = createClient();
+  const [page, setPage] = useState(0);
+  const { db } = createClient();
 
   const fetchLocations = useCallback(async () => {
     if (!user) {
@@ -40,19 +51,31 @@ export default function LocationHistory({
     }
 
     try {
-      const [remoteResult, pendingList] = await Promise.all([
-        supabase
-          .from("locations")
-          .select("*")
-          .eq("user_id", user.id)
-          .order("timestamp", { ascending: false })
-          .limit(100),
-        getPendingLocationsForUser(user.id),
+      const [remoteSnapshot, pendingList] = await Promise.all([
+        getDocs(
+          query(
+            collection(db, "locations"),
+            where("user_id", "==", user.uid),
+            orderBy("timestamp", "desc"),
+            limit(100)
+          )
+        ),
+        getPendingLocationsForUser(user.uid),
       ]);
 
-      if (remoteResult.error) throw remoteResult.error;
+      const remote: Location[] = remoteSnapshot.docs.map((doc) => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          latitude: data.latitude,
+          longitude: data.longitude,
+          timestamp: data.timestamp instanceof Timestamp 
+            ? data.timestamp.toDate().toISOString() 
+            : data.timestamp,
+          wait_time: data.wait_time || 0,
+        };
+      });
 
-      const remote = remoteResult.data || [];
       const pendingAsLocations: Location[] = pendingList.map((p) => ({
         id: p.id,
         latitude: p.latitude,
@@ -70,25 +93,33 @@ export default function LocationHistory({
     } finally {
       setLoading(false);
     }
-  }, [user, supabase]);
+  }, [user, db]);
 
   useEffect(() => {
     if (locationsProp != null) {
       console.log("[Location:LocationHistory] useEffect: using locations from parent", { count: locationsProp.length });
       setLoading(false);
+      setPage(0);
       return;
     }
     console.log("[Location:LocationHistory] useEffect: fetching own locations");
     fetchLocations();
+    setPage(0);
   }, [fetchLocations, locationsProp != null]);
 
-  // Use parent's list when provided so new locations show immediately; otherwise use our fetched list
-  const locations =
+  // Use parent's list when provided so new locations show immediately; otherwise use our fetched list.
+  // We always paginate locally so that at most 10 items are rendered at once.
+  const allLocations =
     locationsProp != null
       ? [...locationsProp].sort(
           (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-        ).slice(0, 100)
+        )
       : locationsState;
+
+  const PAGE_SIZE = 10;
+  const startIndex = page * PAGE_SIZE;
+  const endIndex = startIndex + PAGE_SIZE;
+  const locations = allLocations.slice(startIndex, endIndex);
 
   console.log("[Location:LocationHistory] render", {
     locationsPropNull: locationsProp == null,
@@ -96,6 +127,8 @@ export default function LocationHistory({
     locationsStateLength: locationsState.length,
     displayedLocationsLength: locations.length,
   });
+
+  const canShowMoreLocally = endIndex < allLocations.length;
 
   const formatDate = (timestamp: string) => {
     const date = new Date(timestamp);
@@ -181,6 +214,25 @@ export default function LocationHistory({
           ))
         )}
       </div>
+      {(hasMore || canShowMoreLocally) && (
+        <div className="mt-4 text-center">
+          <button
+            onClick={() => {
+              const nextPage = page + 1;
+              if (nextPage * PAGE_SIZE <= allLocations.length) {
+                setPage(nextPage);
+              } else if (onLoadMore) {
+                setPage(nextPage);
+                onLoadMore();
+              }
+            }}
+            disabled={isLoadingMore}
+            className="px-4 py-2 text-sm bg-blue-500 text-white rounded-md hover:bg-blue-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isLoadingMore ? "Loading more..." : "Load More"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

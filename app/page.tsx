@@ -3,12 +3,17 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 
 import dynamicImport from "next/dynamic";
-import { createClient } from "@/lib/supabase/client";
+import { createClient } from "@/lib/firebase/client";
+import { onAuthStateChanged } from "firebase/auth";
 import Auth from "@/components/Auth";
+import Friends from "@/components/Friends";
 import LocationHistory from "@/components/LocationHistory";
 import PhotoGallery from "@/components/PhotoGallery";
-import type { User } from "@supabase/supabase-js";
+import type { User as FirebaseUser } from "firebase/auth";
 import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocation } from "@/lib/localStore";
+import { getAllLocalPhotosForUser, getLocalPhotoUrl } from "@/lib/localPhotoStorage";
+import { getPhotoMetadataForUser } from "@/lib/firebase/photos";
+import { collection, query, where, orderBy, limit, getDocs, addDoc, Timestamp } from "firebase/firestore";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
 import { BackgroundRunner } from "@capacitor/background-runner";
@@ -44,148 +49,370 @@ interface PhotoWithLocation {
   url?: string;
 }
 
+interface FriendLocation {
+  friend_id: string;
+  friend_email: string;
+  latitude: number;
+  longitude: number;
+  timestamp: string;
+}
+
 export default function Home() {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
   const [locations, setLocations] = useState<Location[]>([]);
+  const [locationsHasMore, setLocationsHasMore] = useState<boolean>(true);
+  const [locationsLoadingMore, setLocationsLoadingMore] = useState<boolean>(false);
   const [photos, setPhotos] = useState<PhotoWithLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [focusLocation, setFocusLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [friendLocations, setFriendLocations] = useState<FriendLocation[]>([]);
   const pendingPhotoUrlsRef = useRef<globalThis.Map<string, string>>(new globalThis.Map());
+  const isLoadingMoreRef = useRef<boolean>(false);
+  const locationsRef = useRef<Location[]>([]);
 
-  // Lazy initialization of Supabase client to avoid issues during build
-  const supabase = useMemo(() => {
+  // Lazy initialization of Firebase client to avoid issues during build
+  const { auth, db } = useMemo(() => {
     if (typeof window === 'undefined') {
-      return null;
+      return { auth: null, db: null };
     }
     return createClient();
   }, []);
 
   useEffect(() => {
-    if (!supabase) return;
+    if (!auth) return;
     
-    supabase.auth.getUser().then(({ data: { user } }) => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
       setUser(user);
       setLoading(false);
     });
 
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-    });
+    return () => unsubscribe();
+  }, [auth]);
 
-    return () => subscription.unsubscribe();
-  }, [supabase]);
+  const LOCATIONS_PAGE_SIZE = 10;
 
-  const fetchLocations = useCallback(async () => {
-    console.log("[Location:page] fetchLocations 1. Entry", { hasUser: !!user, hasSupabase: !!supabase });
-    if (!user || !supabase) {
-      console.log("[Location:page] fetchLocations 1b. Early return: no user or supabase");
-      setLocations([]);
+  const LOCATIONS_CACHE_KEY = "travel_locations_cache";
+
+  /** Persist locations to localStorage so they survive reload. */
+  const persistLocations = useCallback((userId: string, locs: Location[]) => {
+    if (typeof window === "undefined" || !locs.length) return;
+    try {
+      localStorage.setItem(
+        `${LOCATIONS_CACHE_KEY}_${userId}`,
+        JSON.stringify(locs)
+      );
+    } catch (e) {
+      console.warn("Failed to persist locations to localStorage", e);
+    }
+  }, []);
+
+  /** Restore locations from localStorage for the current user (used on reload). */
+  const restoreLocationsFromCache = useCallback((userId: string): Location[] => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(`${LOCATIONS_CACHE_KEY}_${userId}`);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw) as Location[];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  /**
+   * Fetch a page of locations (remote + pending), newest first.
+   * - On initial load we fetch only the latest 10 rows from Supabase to avoid pulling the full history.
+   * - As the user scrolls the history list, we load additional pages of 10 using the timestamp cursor.
+   */
+  const fetchLocations = useCallback(
+    async ({ reset = false }: { reset?: boolean } = {}) => {
+      console.log("[Location:page] fetchLocations 1. Entry", {
+        hasUser: !!user,
+        hasDb: !!db,
+        reset,
+      });
+      if (!user || !db) {
+        console.log(
+          "[Location:page] fetchLocations 1b. Early return: no user or db"
+        );
+        setLocations([]);
+        setLocationsHasMore(false);
+        return;
+      }
+
+      // Prevent overlapping "load more" requests using ref.
+      // This guard and the loading flag only apply to non-reset "Load More" calls
+      // so that automatic refreshes (initial load, syncs) don't flip the button
+      // label to "Loading more..." or look like user-initiated pagination.
+      if (!reset) {
+        if (isLoadingMoreRef.current) {
+          console.log("[Location:page] fetchLocations - already loading, skipping");
+          return;
+        }
+        isLoadingMoreRef.current = true;
+        setLocationsLoadingMore(true);
+      }
+
+      try {
+        console.log(
+          "[Location:page] fetchLocations 2. Fetching remote page + pending"
+        );
+
+        // For pagination we always order by timestamp DESC so the newest items are first.
+        // When not resetting, request items strictly older than the last one we already have.
+        // Use ref to get current locations without causing dependency issues
+        const currentLocations = reset ? [] : locationsRef.current;
+        const lastKnownOldest =
+          currentLocations.length > 0
+            ? currentLocations[currentLocations.length - 1]
+            : null;
+
+        let locationsQuery = query(
+          collection(db, "locations"),
+          where("user_id", "==", user.uid),
+          orderBy("timestamp", "desc"),
+          limit(LOCATIONS_PAGE_SIZE + 1) // fetch one extra row to detect hasMore
+        );
+
+        // Note: Firestore doesn't support lt() with orderBy on different fields easily
+        // For now, we'll fetch and filter client-side. For better performance, consider
+        // using a timestamp-based cursor or composite index.
+        const [remoteSnapshot, pendingList] = await Promise.all([
+          getDocs(locationsQuery),
+          getPendingLocationsForUser(user.uid),
+        ]);
+
+        let remoteDesc = remoteSnapshot.docs.map((doc) => {
+          const data = doc.data();
+          return {
+            id: doc.id,
+            latitude: data.latitude,
+            longitude: data.longitude,
+            timestamp: data.timestamp instanceof Timestamp 
+              ? data.timestamp.toDate().toISOString() 
+              : data.timestamp,
+            wait_time: data.wait_time || 0,
+          };
+        });
+
+        // Filter by timestamp if paginating
+        if (!reset && lastKnownOldest) {
+          remoteDesc = remoteDesc.filter(
+            (loc) => new Date(loc.timestamp).getTime() < new Date(lastKnownOldest!.timestamp).getTime()
+          );
+        }
+
+        const hasMore = remoteDesc.length > LOCATIONS_PAGE_SIZE;
+        const pageRemoteDesc = remoteDesc.slice(0, LOCATIONS_PAGE_SIZE);
+
+        setLocationsHasMore(hasMore);
+
+        const pendingAsLocations: Location[] = pendingList.map((p) => ({
+          id: p.id,
+          latitude: p.latitude,
+          longitude: p.longitude,
+          timestamp: p.timestamp,
+          wait_time: p.wait_time,
+        }));
+
+        // Merge new page + pending into existing list, de-duplicated by id and sorted DESC (newest first)
+        setLocations((prev) => {
+          const base: Location[] = reset ? [] : prev;
+          const byId: Record<string, Location> = {};
+
+          for (const loc of base) {
+            byId[loc.id] = loc;
+          }
+          for (const loc of pageRemoteDesc as Location[]) {
+            if (loc && loc.id) {
+              byId[loc.id] = loc as Location;
+            }
+          }
+          for (const loc of pendingAsLocations) {
+            byId[loc.id] = loc;
+          }
+
+          const mergedArray = Object.values(byId).sort(
+            (a, b) =>
+              new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+          );
+
+          console.log("[Location:page] fetchLocations 3. Merged page", {
+            remotePageCount: pageRemoteDesc.length,
+            pendingCount: pendingList.length,
+            mergedCount: mergedArray.length,
+            hasMore,
+          });
+
+          return mergedArray;
+        });
+      } catch (error) {
+        console.error("[Location:page] fetchLocations Error:", error);
+      } finally {
+        if (!reset) {
+          isLoadingMoreRef.current = false;
+          setLocationsLoadingMore(false);
+        }
+      }
+    },
+    [user, db]
+  );
+
+  const fetchFriendLocations = useCallback(async () => {
+    if (!user || !db) {
+      setFriendLocations([]);
       return;
     }
 
     try {
-      console.log("[Location:page] fetchLocations 2. Fetching remote + pending");
-      const [remoteResult, pendingList] = await Promise.all([
-        supabase
-          .from("locations")
-          .select("*")
-          .eq("user_id", user.id)
-          .order("timestamp", { ascending: true }),
-        getPendingLocationsForUser(user.id),
-      ]);
-
-      if (remoteResult.error) {
-        console.log("[Location:page] fetchLocations 2. Remote error", remoteResult.error);
-        throw remoteResult.error;
-      }
-
-      const remote = remoteResult.data || [];
-      const pendingAsLocations: Location[] = pendingList.map((p) => ({
-        id: p.id,
-        latitude: p.latitude,
-        longitude: p.longitude,
-        timestamp: p.timestamp,
-        wait_time: p.wait_time,
-      }));
-
-      const merged = [...remote, ...pendingAsLocations].sort(
-        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      // Get friendships where current user is the friend and sharing is enabled
+      const friendshipsSnapshot = await getDocs(
+        query(
+          collection(db, "friendships"),
+          where("friend_id", "==", user.uid),
+          where("share_location_with_friend", "==", true)
+        )
       );
-      console.log("[Location:page] fetchLocations 3. Merged", { remoteCount: remote.length, pendingCount: pendingList.length, mergedCount: merged.length, ids: merged.map((l) => l.id) });
-      setLocations(merged);
-      console.log("[Location:page] fetchLocations 4. setLocations(merged) called");
-    } catch (error) {
-      console.error("[Location:page] fetchLocations Error:", error);
-    }
-  }, [user, supabase]);
 
-  // Sync pending locations to Supabase (upload then remove from local). Used by 5-min background interval.
-  const syncPendingLocationsToSupabase = useCallback(async () => {
-    if (!user || !supabase) return;
-    try {
-      const pending = await getPendingLocationsForUser(user.id);
-      if (pending.length === 0) return;
-      const { data: { user: authUser } } = await supabase.auth.getUser();
-      if (!authUser || authUser.id !== user.id) return;
-      for (const loc of pending) {
-        // Include time since last update so wait_time reflects total time at this place (even if no location updates in background)
-        const storedWait = loc.wait_time ?? 0;
-        const elapsedSinceUpdate = Math.max(0, Math.floor((Date.now() - new Date(loc.timestamp).getTime()) / 1000));
-        const effectiveWaitTime = storedWait + elapsedSinceUpdate;
-        const isWaitTimeTopUp = elapsedSinceUpdate > 0;
-        console.log(
-          isWaitTimeTopUp
-            ? "[Location:sync] uploading location with wait_time top-up"
-            : "[Location:sync] uploading new location",
-          { id: loc.id, effectiveWaitTime, elapsedSinceUpdate, storedWait }
+      // Get latest location for each friend
+      const friendLocationsPromises = friendshipsSnapshot.docs.map(async (friendshipDoc) => {
+        const friendshipData = friendshipDoc.data();
+        const friendUserId = friendshipData.user_id;
+        
+        // Get latest location for this friend
+        const locationsSnapshot = await getDocs(
+          query(
+            collection(db, "locations"),
+            where("user_id", "==", friendUserId),
+            orderBy("timestamp", "desc"),
+            limit(1)
+          )
         );
 
-        const { error } = await supabase
-          .from("locations")
-          .insert({
-            user_id: loc.user_id,
-            latitude: loc.latitude,
-            longitude: loc.longitude,
-            timestamp: loc.timestamp,
-            wait_time: effectiveWaitTime,
-          });
-        if (!error) await deletePendingLocation(loc.id);
+        if (locationsSnapshot.empty) return null;
+
+        const locationDoc = locationsSnapshot.docs[0];
+        const locationData = locationDoc.data();
+        
+        return {
+          friend_id: friendUserId,
+          friend_email: friendshipData.friend_email,
+          latitude: locationData.latitude,
+          longitude: locationData.longitude,
+          timestamp: locationData.timestamp instanceof Timestamp 
+            ? locationData.timestamp.toDate().toISOString() 
+            : locationData.timestamp,
+        };
+      });
+
+      const results = await Promise.all(friendLocationsPromises);
+      const rows = results.filter((r): r is FriendLocation => r !== null);
+      setFriendLocations(rows);
+    } catch (e) {
+      console.warn("[Friends] fetchFriendLocations failed", e);
+    }
+  }, [user, db]);
+
+  // Sync pending locations to Firestore (upload then remove from local).
+  // Battery-friendly: one batched HTTP insert per run, at most every 5 minutes via the interval below.
+  const syncPendingLocationsToFirestore = useCallback(async () => {
+    if (!user || !db) return;
+    try {
+      const pending = await getPendingLocationsForUser(user.uid);
+      if (pending.length === 0) return;
+
+      const now = Date.now();
+      const rows = pending.map((loc) => {
+        const storedWait = loc.wait_time ?? 0;
+        const elapsedSinceUpdate = Math.max(
+          0,
+          Math.floor((now - new Date(loc.timestamp).getTime()) / 1000)
+        );
+        const effectiveWaitTime = storedWait + elapsedSinceUpdate;
+        return {
+          user_id: loc.user_id,
+          latitude: loc.latitude,
+          longitude: loc.longitude,
+          timestamp: Timestamp.fromDate(new Date(loc.timestamp)),
+          wait_time: effectiveWaitTime,
+          created_at: Timestamp.now(),
+        };
+      });
+
+      // Insert all locations in parallel
+      await Promise.all(rows.map((row) => addDoc(collection(db, "locations"), row)));
+      
+      for (const loc of pending) {
+        await deletePendingLocation(loc.id);
       }
-      fetchLocations();
+      // Clear any stale snapshot that might still be in native Preferences so the
+      // background runner doesn't re-upload already-synced locations.
+      if (isNativePlatform()) {
+        try {
+          await Preferences.remove({ key: "jeethtravel.pending" });
+        } catch {
+          // Best-effort; safe to ignore if this fails.
+        }
+      }
+      
+      // After syncing, refetch from the first page so the on-screen history/map stay up to date
+      fetchLocations({ reset: true });
     } catch (e) {
       console.warn("[Location:sync] Background sync failed", e);
     }
-  }, [user, supabase, fetchLocations]);
+  }, [user, db, fetchLocations]);
 
-  // Upload pending locations in the background every 5 minutes
+  // While the app is in the foreground, upload pending locations as often as every 30 seconds
+  // (single batched HTTP call per run). Background uploads are still throttled separately
+  // inside the native background runner.
   useEffect(() => {
-    if (!user || !supabase) return;
-    const intervalMs = 5 * 60 * 1000;
-    const id = setInterval(syncPendingLocationsToSupabase, intervalMs);
+    if (!user || !db) return;
+    const intervalMs = 30 * 1000;
+    const id = setInterval(syncPendingLocationsToFirestore, intervalMs);
     return () => clearInterval(id);
-  }, [user, supabase, syncPendingLocationsToSupabase]);
+  }, [user, db, syncPendingLocationsToFirestore]);
 
   // Sync pending + auth to Preferences so Background Runner can upload when OS runs the task (iOS/Android).
   // Must run while app is in foreground: when we only sync on background, iOS often suspends before the
   // async write completes, so the runner finds nothing. We sync proactively so data is there when the runner runs.
   const syncPendingToPreferencesForRunner = useCallback(async () => {
-    if (!isNativePlatform() || !user || !supabase) return;
+    if (!isNativePlatform() || !user || !auth) return;
     try {
-      const pending = await getPendingLocationsForUser(user.id);
-      const { data: { session } } = await supabase.auth.getSession();
-      if (pending.length > 0 && session?.access_token) {
+      // First, apply any uploadedIds recorded by the background runner so we don't
+      // keep re-writing already-uploaded locations back into Preferences/IndexedDB.
+      try {
+        const { value: uploadedRaw } = await Preferences.get({
+          key: "jeethtravel.uploadedIds",
+        });
+        if (uploadedRaw) {
+          const uploadedIds = JSON.parse(uploadedRaw) as string[];
+          if (Array.isArray(uploadedIds) && uploadedIds.length > 0) {
+            console.log("[Location:Preferences] pruning uploadedIds before snapshot", {
+              count: uploadedIds.length,
+            });
+            for (const id of uploadedIds) {
+              await deletePendingLocation(id);
+            }
+          }
+          await Preferences.remove({ key: "jeethtravel.uploadedIds" });
+        }
+      } catch (e) {
+        console.warn("[Location:Preferences] failed to prune uploadedIds before snapshot", e);
+      }
+
+      const pending = await getPendingLocationsForUser(user.uid);
+      const token = await auth.currentUser?.getIdToken();
+      if (pending.length > 0 && token) {
         await Preferences.set({
           key: "jeethtravel.pending",
           value: JSON.stringify(pending),
         });
         await Preferences.set({
-          key: "jeethtravel.supabaseAuth",
+          key: "jeethtravel.firebaseAuth",
           value: JSON.stringify({
-            url: process.env.NEXT_PUBLIC_SUPABASE_URL,
-            anonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-            accessToken: session.access_token,
+            projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+            apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+            accessToken: token,
           }),
         });
         console.log("[Location:Preferences] synced pending to Preferences for runner", { count: pending.length });
@@ -193,17 +420,19 @@ export default function Home() {
     } catch (e) {
       console.warn("[Location:Preferences] sync for runner failed", e);
     }
-  }, [user, supabase]);
+  }, [user, auth]);
 
-  // Proactive sync: write pending to Preferences every 15s while in foreground so Background Runner has data
-  // when iOS runs it (we can't rely on syncing only when backgrounding—iOS may suspend before async completes).
+  // Proactive sync: we only write to Preferences when pending locations change or on app
+  // background/foreground transitions. No periodic timer to minimize background work.
+
+  // Periodically refresh friends' latest locations so the map stays up to date
   useEffect(() => {
-    if (!isNativePlatform() || !user || !supabase) return;
-    const intervalMs = 15 * 1000;
-    const id = setInterval(syncPendingToPreferencesForRunner, intervalMs);
-    syncPendingToPreferencesForRunner(); // run once immediately
+    if (!user || !db) return;
+    fetchFriendLocations();
+    const intervalMs = 30 * 1000;
+    const id = setInterval(fetchFriendLocations, intervalMs);
     return () => clearInterval(id);
-  }, [user, supabase, syncPendingToPreferencesForRunner]);
+  }, [user, db, fetchFriendLocations]);
 
   // On app background: one more sync (best effort). On app active: apply uploadedIds from runner.
   useEffect(() => {
@@ -217,7 +446,7 @@ export default function Home() {
             console.log("[Location:uploadedIds] applying from runner", { count: ids.length });
             for (const id of ids) await deletePendingLocation(id);
             await Preferences.remove({ key: "jeethtravel.uploadedIds" });
-            fetchLocations();
+            fetchLocations({ reset: true });
           }
         } catch (e) {
           console.warn("[Location:uploadedIds] apply failed", e);
@@ -242,39 +471,44 @@ export default function Home() {
         details: {},
       });
       console.log("[Location:test] Runner finished");
-      fetchLocations();
+      fetchLocations({ reset: true });
     } catch (e) {
       console.error("[Location:test] Runner failed", e);
     }
   }, [user, syncPendingToPreferencesForRunner, fetchLocations]);
 
   const fetchPhotos = useCallback(async () => {
-    if (!user || !supabase) {
+    if (!user) {
       setPhotos([]);
       return;
     }
 
     try {
-      const [remoteResult, pendingList] = await Promise.all([
-        supabase
-          .from("photos")
-          .select("id, latitude, longitude, timestamp, storage_path")
-          .eq("user_id", user.id)
-          .not("latitude", "is", null)
-          .not("longitude", "is", null)
-          .order("timestamp", { ascending: false }),
-        getPendingPhotosForUser(user.id),
+      const [localRecords, pendingList, firestorePhotos] = await Promise.all([
+        getAllLocalPhotosForUser(user.uid),
+        getPendingPhotosForUser(user.uid),
+        db ? getPhotoMetadataForUser(db, user.uid) : Promise.resolve([]),
       ]);
-
-      if (remoteResult.error) throw remoteResult.error;
-
-      const remote = (remoteResult.data || []).filter(
-        (photo): photo is PhotoWithLocation =>
-          photo.latitude !== null && photo.longitude !== null
-      );
 
       pendingPhotoUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       pendingPhotoUrlsRef.current.clear();
+
+      const localWithUrls: PhotoWithLocation[] = await Promise.all(
+        localRecords
+          .filter((r) => r.latitude != null && r.longitude != null)
+          .map(async (rec) => {
+            const url = await getLocalPhotoUrl(rec);
+            pendingPhotoUrlsRef.current.set(rec.id, url);
+            return {
+              id: rec.id,
+              latitude: rec.latitude!,
+              longitude: rec.longitude!,
+              timestamp: rec.timestamp,
+              storage_path: "",
+              url,
+            };
+          })
+      );
 
       const pendingPhotos: PhotoWithLocation[] = pendingList
         .filter((p) => p.latitude != null && p.longitude != null)
@@ -291,24 +525,66 @@ export default function Home() {
           };
         });
 
-      const merged = [...pendingPhotos, ...remote].sort(
+      const localAndPendingIds = new Set([
+        ...localWithUrls.map((p) => p.id),
+        ...pendingPhotos.map((p) => p.id),
+      ]);
+      const firestoreOnlyWithLocation: PhotoWithLocation[] = firestorePhotos
+        .filter(
+          (m) =>
+            !localAndPendingIds.has(m.id) &&
+            m.latitude != null &&
+            m.longitude != null
+        )
+        .map((m) => ({
+          id: m.id,
+          latitude: m.latitude!,
+          longitude: m.longitude!,
+          timestamp: m.timestamp,
+          storage_path: "",
+          url: undefined,
+        }));
+
+      const merged = [
+        ...pendingPhotos,
+        ...localWithUrls,
+        ...firestoreOnlyWithLocation,
+      ].sort(
         (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       );
       setPhotos(merged);
     } catch (error) {
       console.error("Error fetching photos:", error);
     }
-  }, [user, supabase]);
+  }, [user, db]);
+
+  // Keep locationsRef in sync with locations state
+  useEffect(() => {
+    locationsRef.current = locations;
+  }, [locations]);
+
+  // Persist locations to localStorage whenever they change so they survive reload
+  useEffect(() => {
+    if (user && locations.length > 0) {
+      persistLocations(user.uid, locations);
+    }
+  }, [user, locations, persistLocations]);
 
   useEffect(() => {
     if (user) {
-      fetchLocations();
+      // Restore from cache immediately so the map/history aren't empty on reload
+      const cached = restoreLocationsFromCache(user.uid);
+      if (cached.length > 0) {
+        setLocations(cached);
+      }
+      fetchLocations({ reset: true });
       fetchPhotos();
+      fetchFriendLocations();
     } else {
       setLocations([]);
       setPhotos([]);
     }
-  }, [user, fetchLocations, fetchPhotos]);
+  }, [user, fetchLocations, fetchPhotos, fetchFriendLocations, restoreLocationsFromCache]);
 
   useEffect(() => {
     return () => {
@@ -335,6 +611,13 @@ export default function Home() {
         <div className="mb-6">
           <Auth />
         </div>
+
+        <Friends
+          user={user}
+          onSharingChange={fetchFriendLocations}
+          friendsSharing={friendLocations}
+          onFriendFocus={(location) => setFocusLocation(location)}
+        />
 
         {user && (
           <>
@@ -363,6 +646,7 @@ export default function Home() {
                       timestamp: loc.timestamp,
                     }))}
                     photos={photos}
+                    friendLocations={friendLocations}
                     onLocationUpdate={fetchLocations}
                     focusLocation={focusLocation}
                     onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
@@ -370,17 +654,20 @@ export default function Home() {
                 </div>
               </div>
               <div>
-                <LocationHistory
-                  user={user}
-                  locations={locations}
-                  onLocationSelect={(location) => {
-                    setFocusLocation({
-                      latitude: location.latitude,
-                      longitude: location.longitude,
-                    });
-                  }}
-                  onRefresh={fetchLocations}
-                />
+                  <LocationHistory
+                    user={user}
+                    locations={locations}
+                    onLocationSelect={(location) => {
+                      setFocusLocation({
+                        latitude: location.latitude,
+                        longitude: location.longitude,
+                      });
+                    }}
+                    onRefresh={() => fetchLocations({ reset: true })}
+                    hasMore={locationsHasMore}
+                    isLoadingMore={locationsLoadingMore}
+                    onLoadMore={() => fetchLocations({ reset: false })}
+                  />
               </div>
             </div>
             <div>

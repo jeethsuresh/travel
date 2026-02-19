@@ -1,19 +1,40 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { Capacitor } from "@capacitor/core";
 import { Camera } from "@capacitor/camera";
-import { createClient } from "@/lib/supabase/client";
-import type { User } from "@supabase/supabase-js";
+import type { User as FirebaseUser } from "firebase/auth";
 import exifr from "exifr";
 import { compressImage } from "@/lib/imageCompression";
-import { getCachedImage, fetchImageWithCache } from "@/lib/imageCache";
 import { isNativePlatform } from "@/lib/capacitor";
+import { createClient } from "@/lib/firebase/client";
+import { addPhotoMetadata, getPhotoMetadataForUser, deletePhotoMetadata } from "@/lib/firebase/photos";
 import {
   addPendingPhoto,
   getPendingPhotosForUser,
   deletePendingPhoto,
 } from "@/lib/localStore";
+import {
+  addLocalPhoto,
+  getAllLocalPhotosForUser,
+  getLocalPhotoUrl,
+  deleteLocalPhoto,
+  openPhotoInViewer,
+  type LocalPhotoRecord,
+} from "@/lib/localPhotoStorage";
+
+/** Convert EXIF DMS array [deg, min, sec] to decimal degrees. Ref is e.g. 'N'/'S', 'E'/'W'. */
+function dmsToDecimal(
+  dms: number[] | { [key: number]: number },
+  ref?: string
+): number | null {
+  const arr = Array.isArray(dms) ? dms : [dms[0], dms[1], dms[2]];
+  if (!arr.length || arr.some((n) => n == null || isNaN(Number(n)))) return null;
+  const [d = 0, m = 0, s = 0] = arr.map(Number);
+  let decimal = d + m / 60 + s / 3600;
+  if (ref === "S" || ref === "W") decimal = -decimal;
+  return decimal;
+}
 
 interface Photo {
   id: string;
@@ -23,10 +44,12 @@ interface Photo {
   longitude: number | null;
   timestamp: string;
   url?: string;
+  /** When set, photo is from local storage (IndexedDB/iOS); can use openPhotoInViewer on iOS */
+  localRecord?: LocalPhotoRecord;
 }
 
 interface PhotoGalleryProps {
-  user: User | null;
+  user: FirebaseUser | null;
   onPhotoClick?: (photo: Photo) => void;
   onPhotosUpdate?: () => void;
 }
@@ -45,7 +68,9 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pendingUrlsRef = useRef<Map<string, string>>(new Map());
-  const supabase = createClient();
+  const blobUrlsRef = useRef<Map<string, string>>(new Map());
+
+  const db = useMemo(() => (typeof window !== "undefined" ? createClient().db : null), []);
 
   const fetchPhotos = useCallback(async () => {
     if (!user) {
@@ -55,43 +80,32 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
     setLoading(true);
     try {
-      const [remoteResult, pendingList] = await Promise.all([
-        supabase
-          .from("photos")
-          .select("*")
-          .eq("user_id", user.id)
-          .order("timestamp", { ascending: false }),
-        getPendingPhotosForUser(user.id),
+      const [localRecords, pendingList, firestorePhotos] = await Promise.all([
+        getAllLocalPhotosForUser(user.uid),
+        getPendingPhotosForUser(user.uid),
+        db ? getPhotoMetadataForUser(db, user.uid) : Promise.resolve([]),
       ]);
 
-      if (remoteResult.error) throw remoteResult.error;
-      const data = remoteResult.data || [];
-
-      // Revoke previous pending object URLs to avoid leaks
+      // Revoke previous pending and local blob URLs to avoid leaks
       pendingUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       pendingUrlsRef.current.clear();
+      blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      blobUrlsRef.current.clear();
 
-      const photosWithUrls = await Promise.all(
-        data.map(async (photo: Photo) => {
-          if (!photo.storage_path.startsWith(`${user.id}/`)) {
-            return { ...photo, url: undefined };
-          }
-          if (photo.user_id !== user.id) {
-            return { ...photo, url: undefined };
-          }
-          // Use local cache first — only create signed URL and download if we don't have it
-          const localUrl = await getCachedImage(photo.id);
-          if (localUrl) {
-            return { ...photo, url: localUrl };
-          }
-          const { data: urlData } = await supabase.storage
-            .from("photos")
-            .createSignedUrl(photo.storage_path, 3600);
-          if (!urlData?.signedUrl) {
-            return { ...photo, url: undefined };
-          }
-          const cachedUrl = await fetchImageWithCache(photo.id, urlData.signedUrl);
-          return { ...photo, url: cachedUrl };
+      const localPhotos: Photo[] = await Promise.all(
+        localRecords.map(async (rec) => {
+          const url = await getLocalPhotoUrl(rec);
+          blobUrlsRef.current.set(rec.id, url);
+          return {
+            id: rec.id,
+            user_id: rec.user_id,
+            storage_path: "",
+            latitude: rec.latitude,
+            longitude: rec.longitude,
+            timestamp: rec.timestamp,
+            url,
+            localRecord: rec,
+          };
         })
       );
 
@@ -109,7 +123,20 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         };
       });
 
-      const merged = [...pendingPhotos, ...photosWithUrls].sort(
+      const localAndPendingIds = new Set([...localPhotos.map((p) => p.id), ...pendingPhotos.map((p) => p.id)]);
+      const firestoreOnlyPhotos: Photo[] = firestorePhotos
+        .filter((m) => !localAndPendingIds.has(m.id))
+        .map((m) => ({
+          id: m.id,
+          user_id: m.user_id,
+          storage_path: "",
+          latitude: m.latitude,
+          longitude: m.longitude,
+          timestamp: m.timestamp,
+          url: undefined,
+        }));
+
+      const merged = [...pendingPhotos, ...localPhotos, ...firestoreOnlyPhotos].sort(
         (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       ) as Photo[];
       setPhotos(merged);
@@ -119,7 +146,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
     } finally {
       setLoading(false);
     }
-  }, [user, supabase]);
+  }, [user, db]);
 
   useEffect(() => {
     if (user) {
@@ -127,61 +154,66 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
     }
   }, [user, fetchPhotos]);
 
-  const extractExifData = useCallback(async (file: File): Promise<{ 
-    latitude?: number; 
-    longitude?: number; 
+  const extractExifData = useCallback(async (file: File): Promise<{
+    latitude?: number;
+    longitude?: number;
     timestamp?: string;
   }> => {
+    const result: { latitude?: number; longitude?: number; timestamp?: string } = {};
     try {
-      // Extract EXIF data including GPS coordinates and date/time
       const exifData = await exifr.parse(file, {
         gps: true,
         exif: true,
       });
-      
-      const result: { latitude?: number; longitude?: number; timestamp?: string } = {};
-      
-      // Extract GPS coordinates
-      if (exifData && exifData.latitude && exifData.longitude) {
-        result.latitude = exifData.latitude;
-        result.longitude = exifData.longitude;
+
+      if (!exifData) return result;
+
+      // GPS: try normalized lat/long first, then raw DMS
+      let lat = exifData.latitude ?? exifData.GPSLatitude ?? exifData.Latitude;
+      let lng = exifData.longitude ?? exifData.GPSLongitude ?? exifData.Longitude;
+      if (typeof lat === "number" && typeof lng === "number") {
+        result.latitude = lat;
+        result.longitude = lng;
+      } else if (Array.isArray(lat) && Array.isArray(lng)) {
+        const latNum = dmsToDecimal(lat, exifData.GPSLatitudeRef ?? exifData.latitudeRef);
+        const lngNum = dmsToDecimal(lng, exifData.GPSLongitudeRef ?? exifData.longitudeRef);
+        if (latNum != null && lngNum != null) {
+          result.latitude = latNum;
+          result.longitude = lngNum;
+        }
       }
-      
-      // Extract date/time when photo was taken
-      // Try different EXIF date fields (different cameras use different fields)
-      const dateTimeOriginal = exifData?.DateTimeOriginal || exifData?.DateTime || exifData?.CreateDate;
-      
+
+      // Date/time: try all common EXIF date tags
+      const dateTimeOriginal =
+        exifData.DateTimeOriginal ??
+        exifData.DateTime ??
+        exifData.CreateDate ??
+        exifData.ModifyDate ??
+        exifData.SubSecTimeOriginal;
       if (dateTimeOriginal) {
         let photoDate: Date;
-        
-        // Handle different date formats
-        if (typeof dateTimeOriginal === 'string') {
-          // EXIF date format is typically "YYYY:MM:DD HH:MM:SS"
-          // Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS" for Date parsing
-          const dateStr = dateTimeOriginal.replace(/(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+        if (typeof dateTimeOriginal === "string") {
+          const dateStr = dateTimeOriginal.replace(/(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3");
           photoDate = new Date(dateStr);
         } else if (dateTimeOriginal instanceof Date) {
           photoDate = dateTimeOriginal;
         } else {
-          // Try to parse as number (Unix timestamp)
           photoDate = new Date(dateTimeOriginal);
         }
-        
-        // Validate the date is reasonable (not invalid, not in the future, not too old)
-        if (!isNaN(photoDate.getTime()) && 
-            photoDate.getTime() <= Date.now() && 
-            photoDate.getTime() > new Date('1900-01-01').getTime()) {
+        if (
+          !isNaN(photoDate.getTime()) &&
+          photoDate.getTime() <= Date.now() &&
+          photoDate.getTime() > new Date("1900-01-01").getTime()
+        ) {
           result.timestamp = photoDate.toISOString();
         }
       }
-      
+
       return result;
     } catch (error) {
-      // EXIF extraction failed, continue without EXIF data
-      console.log("Could not extract EXIF data:", error);
+      console.warn("Could not extract EXIF data:", error);
     }
-    
-    return {};
+    return result;
   }, []);
 
   const uploadPhoto = useCallback(
@@ -196,12 +228,8 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       }
 
       try {
-        const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
-        if (authError || !authUser) {
-          throw new Error("Authentication failed. Please sign in again.");
-        }
-        if (authUser.id !== user.id) {
-          throw new Error("User ID mismatch. Please refresh the page.");
+        if (!user) {
+          throw new Error("User not authenticated");
         }
 
         let finalLatitude: number | undefined;
@@ -209,12 +237,31 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         let photoTimestamp: string | undefined;
 
         const exifData = await extractExifData(file);
-        if (exifData.latitude && exifData.longitude) {
+        if (exifData.latitude != null && exifData.longitude != null) {
           finalLatitude = exifData.latitude;
           finalLongitude = exifData.longitude;
         }
         if (exifData.timestamp) {
           photoTimestamp = exifData.timestamp;
+        }
+
+        // If no GPS in EXIF (e.g. camera capture, stripped file), use device position so photo appears on map
+        if ((finalLatitude == null || finalLongitude == null) && typeof navigator !== "undefined" && navigator.geolocation) {
+          try {
+            const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+              navigator.geolocation.getCurrentPosition(resolve, reject, {
+                enableHighAccuracy: true,
+                timeout: 8000,
+                maximumAge: 60000,
+              });
+            });
+            if (pos?.coords) {
+              finalLatitude = finalLatitude ?? pos.coords.latitude;
+              finalLongitude = finalLongitude ?? pos.coords.longitude;
+            }
+          } catch (e) {
+            console.warn("Could not get device position for photo:", e);
+          }
         }
 
         if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 10 }));
@@ -226,7 +273,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
         // Store locally first so it appears immediately
         const pending = await addPendingPhoto({
-          user_id: authUser.id,
+          user_id: user.uid,
           latitude: finalLatitude ?? null,
           longitude: finalLongitude ?? null,
           timestamp: photoTimestamp ?? new Date().toISOString(),
@@ -253,36 +300,27 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
         onPhotosUpdate?.();
 
-        // Upload to Supabase in background
+        // Persist to local storage (IndexedDB / iOS Filesystem) and Firestore metadata in background
         (async () => {
           try {
-            const fileName = `${authUser.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
-            const { error: uploadError } = await supabase.storage
-              .from("photos")
-              .upload(fileName, compressedFile, {
-                cacheControl: "3600",
-                upsert: false,
-              });
-
-            if (uploadError) throw uploadError;
-
             if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 70 }));
 
-            const insertData: Record<string, unknown> = {
-              user_id: authUser.id,
-              storage_path: fileName,
+            const rec = await addLocalPhoto(user.uid, compressedFile, {
               latitude: finalLatitude ?? null,
               longitude: finalLongitude ?? null,
-            };
-            if (photoTimestamp) insertData.timestamp = photoTimestamp;
+              timestamp: photoTimestamp ?? pending.timestamp,
+            });
 
-            const { error: dbError } = await supabase
-              .from("photos")
-              .insert(insertData)
-              .select()
-              .single();
-
-            if (dbError) throw dbError;
+            if (db) {
+              await addPhotoMetadata(db, user.uid, {
+                id: rec.id,
+                local_name: rec.id,
+                latitude: rec.latitude,
+                longitude: rec.longitude,
+                timestamp: rec.timestamp,
+                created_at: rec.created_at,
+              });
+            }
 
             if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 100 }));
 
@@ -295,7 +333,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
             await fetchPhotos();
             onPhotosUpdate?.();
           } catch (err) {
-            console.error("Background photo upload failed:", err);
+            console.error("Background local photo save failed:", err);
             if (fileId) {
               setUploadProgress((prev) => {
                 const next = { ...prev };
@@ -317,7 +355,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         throw error;
       }
     },
-    [user, supabase, extractExifData, fetchPhotos, onPhotosUpdate]
+    [user, db, extractExifData, fetchPhotos, onPhotosUpdate]
   );
 
   const handleFileSelect = useCallback(
@@ -497,48 +535,15 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       return;
     }
 
-    if (photo.user_id !== user.id) {
+    if (photo.user_id !== user.uid) {
       setError("You don't have permission to download this photo");
       return;
     }
 
-    // Pending (local-only) photo: use existing url (blob URL)
-    const isPending = !photo.storage_path || !photo.storage_path.startsWith(`${user.id}/`);
-    if (isPending && photo.url) {
-      try {
-        const response = await fetch(photo.url);
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = `photo-${photo.id}.jpg`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(url);
-      } catch (e) {
-        setError("Failed to download photo");
-      }
-      return;
-    }
-
-    if (!photo.storage_path.startsWith(`${user.id}/`)) {
-      setError("Invalid photo path");
-      return;
-    }
-
-    // Use local cache first — only create signed URL if we don't have it locally
-    let downloadUrl = photo.url ?? (await getCachedImage(photo.id));
+    const downloadUrl = photo.url;
     if (!downloadUrl) {
-      const { data: urlData, error: urlError } = await supabase.storage
-        .from("photos")
-        .createSignedUrl(photo.storage_path, 3600);
-
-      if (urlError || !urlData) {
-        setError("Failed to generate download URL");
-        return;
-      }
-      downloadUrl = urlData.signedUrl;
+      setError("Photo not available");
+      return;
     }
 
     try {
@@ -547,18 +552,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         setError("Failed to download photo");
         return;
       }
-      let blob: Blob;
-      try {
-        const arrayBuffer = await response.arrayBuffer();
-        const contentType = response.headers.get("content-type") || "image/jpeg";
-        blob = new Blob([arrayBuffer], { type: contentType });
-      } catch (bodyError) {
-        console.warn("Download body read failed (e.g. Content-Length mismatch):", (bodyError as Error)?.message);
-        setError("Failed to download photo (network error)");
-        return;
-      }
-
-      // Create a temporary URL
+      const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -568,23 +562,25 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       document.body.removeChild(link);
       window.URL.revokeObjectURL(url);
 
-      // For mobile devices, try to save to camera roll
       if (navigator.share && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
         try {
-          const file = new File([blob], `photo-${photo.id}.jpg`, {
-            type: "image/jpeg",
-          });
-          await navigator.share({
-            files: [file],
-            title: "Travel Photo",
-          });
-        } catch (shareError) {
+          const file = new File([blob], `photo-${photo.id}.jpg`, { type: "image/jpeg" });
+          await navigator.share({ files: [file], title: "Travel Photo" });
+        } catch {
           // Share API failed, download already happened
         }
       }
     } catch (error) {
       console.error("Error downloading photo:", error);
       setError("Failed to download photo");
+    }
+  }, []);
+
+  const viewPhotoInViewer = useCallback(async (photo: Photo) => {
+    if (photo.localRecord) {
+      await openPhotoInViewer(photo.localRecord);
+    } else if (photo.url) {
+      window.open(photo.url, "_blank");
     }
   }, []);
 
@@ -595,17 +591,15 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         return;
       }
 
-      if (photo.user_id !== user.id) {
+      if (photo.user_id !== user.uid) {
         setError("You don't have permission to delete this photo");
         return;
       }
 
       if (!confirm("Are you sure you want to delete this photo?")) return;
 
-      const isPending = !photo.storage_path || !photo.storage_path.startsWith(`${user.id}/`);
-
+      const isPending = !photo.localRecord && !!photo.url;
       if (isPending) {
-        // Local-only pending photo: remove from local store and UI
         const urlToRevoke = pendingUrlsRef.current.get(photo.id);
         if (urlToRevoke) {
           URL.revokeObjectURL(urlToRevoke);
@@ -617,34 +611,27 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
         return;
       }
 
-      if (!isPending) {
-        // Synced photo: delete from storage and database
-        setPhotos((prevPhotos) => prevPhotos.filter((p) => p.id !== photo.id));
-
-        try {
-          const { error: storageError } = await supabase.storage
-            .from("photos")
-            .remove([photo.storage_path]);
-
-          if (storageError) throw storageError;
-
-          const { error: dbError } = await supabase
-            .from("photos")
-            .delete()
-            .eq("id", photo.id)
-            .eq("user_id", user.id);
-
-          if (dbError) throw dbError;
-
-          if (onPhotosUpdate) onPhotosUpdate();
-        } catch (error) {
-          console.error("Error deleting photo:", error);
-          setError("Failed to delete photo");
-          await fetchPhotos();
+      setPhotos((prevPhotos) => prevPhotos.filter((p) => p.id !== photo.id));
+      try {
+        if (photo.localRecord) {
+          await deleteLocalPhoto(photo.id);
+          const urlToRevoke = blobUrlsRef.current.get(photo.id);
+          if (urlToRevoke) {
+            URL.revokeObjectURL(urlToRevoke);
+            blobUrlsRef.current.delete(photo.id);
+          }
         }
+        if (db && (photo.localRecord || photo.url === undefined)) {
+          await deletePhotoMetadata(db, photo.id);
+        }
+        if (onPhotosUpdate) onPhotosUpdate();
+      } catch (error) {
+        console.error("Error deleting photo:", error);
+        setError("Failed to delete photo");
+        await fetchPhotos();
       }
     },
-    [user, supabase, fetchPhotos, onPhotosUpdate]
+    [user, db, fetchPhotos, onPhotosUpdate]
   );
 
   const deleteSelectedPhotos = useCallback(
@@ -652,12 +639,7 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
       if (!user || selectedPhotos.size === 0) return;
 
       const photosToDelete = photos.filter((p) => selectedPhotos.has(p.id));
-
-      // Security check: Verify all photos belong to current user
-      const invalidPhotos = photosToDelete.filter(
-        (p) => p.user_id !== user.id || !p.storage_path.startsWith(`${user.id}/`)
-      );
-
+      const invalidPhotos = photosToDelete.filter((p) => p.user_id !== user.uid);
       if (invalidPhotos.length > 0) {
         setError("Some photos cannot be deleted");
         return;
@@ -665,44 +647,50 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
       if (!confirm(`Are you sure you want to delete ${selectedPhotos.size} photo(s)?`)) return;
 
-      // Optimistically remove from UI
       setPhotos((prevPhotos) => prevPhotos.filter((p) => !selectedPhotos.has(p.id)));
 
       try {
-        // Delete from storage
-        const storagePaths = photosToDelete.map((p) => p.storage_path);
-        const { error: storageError } = await supabase.storage
-          .from("photos")
-          .remove(storagePaths);
-
-        if (storageError) throw storageError;
-
-        // Delete from database
-        const photoIds = Array.from(selectedPhotos);
-        const { error: dbError } = await supabase
-          .from("photos")
-          .delete()
-          .in("id", photoIds)
-          .eq("user_id", user.id);
-
-        if (dbError) throw dbError;
-
-        // Clear selection and exit selection mode
+        await Promise.all(
+          photosToDelete
+            .filter((p) => p.localRecord)
+            .map((photo) => deleteLocalPhoto(photo.id))
+        );
+        await Promise.all(
+          photosToDelete
+            .filter((p) => !p.localRecord)
+            .map(async (p) => {
+              const urlToRevoke = pendingUrlsRef.current.get(p.id);
+              if (urlToRevoke) {
+                URL.revokeObjectURL(urlToRevoke);
+                pendingUrlsRef.current.delete(p.id);
+              }
+              await deletePendingPhoto(p.id);
+            })
+        );
+        if (db) {
+          await Promise.all(
+            photosToDelete
+              .filter((p) => p.localRecord || p.url === undefined)
+              .map((p) => deletePhotoMetadata(db, p.id))
+          );
+        }
+        photosToDelete.forEach((p) => {
+          const u = blobUrlsRef.current.get(p.id);
+          if (u) {
+            URL.revokeObjectURL(u);
+            blobUrlsRef.current.delete(p.id);
+          }
+        });
         setSelectedPhotos(new Set());
         setSelectionMode(false);
-
-        // Notify parent component
-        if (onPhotosUpdate) {
-          onPhotosUpdate();
-        }
+        if (onPhotosUpdate) onPhotosUpdate();
       } catch (error) {
         console.error("Error deleting photos:", error);
         setError("Failed to delete some photos");
-        // Revert optimistic update on error
         await fetchPhotos();
       }
     },
-    [user, supabase, selectedPhotos, photos, onPhotosUpdate, fetchPhotos]
+    [user, selectedPhotos, photos, onPhotosUpdate, fetchPhotos]
   );
 
   const togglePhotoSelection = useCallback((photoId: string) => {
@@ -914,8 +902,13 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
                   }}
                 />
               ) : (
-                <div className="w-full h-full flex items-center justify-center">
-                  <p className="text-gray-400 text-sm">Loading...</p>
+                <div className="w-full h-full flex flex-col items-center justify-center p-2">
+                  <p className="text-gray-400 text-sm text-center">
+                    {photo.localRecord ? "Loading..." : "Not on this device"}
+                  </p>
+                  {!photo.localRecord && photo.latitude != null && photo.longitude != null && (
+                    <p className="text-gray-500 text-xs mt-1">Location saved</p>
+                  )}
                 </div>
               )}
               {!selectionMode && (
@@ -932,6 +925,18 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
                       title="Show on Map"
                     >
                       Map
+                    </button>
+                  )}
+                  {isNativePlatform() && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        viewPhotoInViewer(photo);
+                      }}
+                      className="px-3 py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-md text-sm"
+                      title="Open in system viewer"
+                    >
+                      View
                     </button>
                   )}
                   <button
