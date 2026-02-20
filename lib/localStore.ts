@@ -17,6 +17,7 @@ export interface PendingLocation {
   longitude: number;
   timestamp: string;
   wait_time: number;
+  trip_ids?: string[];
   created_at: string;
 }
 
@@ -26,6 +27,7 @@ export interface PendingPhoto {
   latitude: number | null;
   longitude: number | null;
   timestamp: string;
+  trip_ids?: string[];
   blob: Blob;
   created_at: string;
 }
@@ -113,7 +115,7 @@ export async function addPendingLocation(
 
 export async function updatePendingLocation(
   id: string,
-  updates: Partial<Pick<PendingLocation, "latitude" | "longitude" | "timestamp" | "wait_time">>
+  updates: Partial<Pick<PendingLocation, "latitude" | "longitude" | "timestamp" | "wait_time" | "trip_ids">>
 ): Promise<void> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
