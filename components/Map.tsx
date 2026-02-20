@@ -10,6 +10,7 @@ import {
   updatePendingLocation,
   getPendingLocationsForUser,
 } from "@/lib/localStore";
+import { getActiveTrips } from "@/lib/firebase/trips";
 import { Geolocation } from "@capacitor/geolocation";
 import { isNativePlatform } from "@/lib/capacitor";
 
@@ -284,11 +285,17 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
           if (lastLocationRef.current.isLocal) {
             const newWaitTime = (lastLocationRef.current.wait_time ?? 0) + timeDiff;
             console.log("[Location:update] updating pending wait_time", { id: lastLocationRef.current.id, timeDiff, newWaitTime });
+            
+            // Also update trip_ids if trips are active
+            const activeTrips = await getActiveTrips(user.id);
+            const tripIds = activeTrips.map((trip) => trip.id);
+            
             await updatePendingLocation(lastLocationRef.current.id, {
               wait_time: newWaitTime,
               timestamp: nowISO,
               latitude: lat,
               longitude: lng,
+              trip_ids: tripIds.length > 0 ? tripIds : undefined,
             });
             lastLocationRef.current = {
               ...lastLocationRef.current,
@@ -309,12 +316,18 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
 
       // New location: store in IndexedDB first (sync and Background App Refresh will upload later)
       console.log("[Location:update] adding new pending location", { lat, lng });
+      
+      // Get active trips to tag this location
+      const activeTrips = await getActiveTrips(user.id);
+      const tripIds = activeTrips.map((trip) => trip.id);
+      
       const pending = await addPendingLocation({
         user_id: user.id,
         latitude: lat,
         longitude: lng,
         timestamp: nowISO,
         wait_time: 0,
+        trip_ids: tripIds.length > 0 ? tripIds : undefined,
       });
       lastLocationRef.current = {
         lat: pending.latitude,

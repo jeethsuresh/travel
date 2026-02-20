@@ -1,7 +1,10 @@
 /**
- * Background Runner: uploads pending locations to Firebase Firestore when iOS/Android runs this task.
- * Reads from CapacitorKV (same store as @capacitor/preferences: use "CapacitorStorage.<key>").
- * Main app writes jeethtravel.pending and jeethtravel.firebaseAuth (projectId + idToken) via Preferences.
+ * Background Runner: minimal, battery-friendly uploader.
+ *
+ * Responsibilities:
+ * - Read pending locations + auth from CapacitorKV (same store as @capacitor/preferences).
+ * - At most ONE HTTP request per invocation, and never more than once every 5 minutes.
+ * - Send pending locations to Firestore (main app writes jeethtravel.pending and jeethtravel.firebaseAuth via Preferences).
  */
 addEventListener("uploadPendingLocations", async function (resolve, reject) {
   try {
@@ -31,9 +34,23 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
     var idToken = auth.idToken;
     var baseUrl = "https://firestore.googleapis.com/v1/projects/" + projectId + "/databases/(default)/documents/locations";
 
+    var nowMs = Date.now();
+    var lastUploadKey = "CapacitorStorage.jeethtravel.lastUploadMs";
+    var lastUploadRaw = CapacitorKV.get(lastUploadKey);
+    var lastUploadValue = lastUploadRaw && lastUploadRaw.value ? lastUploadRaw.value : null;
+    var lastUploadMs = 0;
+    if (lastUploadValue) {
+      var parsed = parseInt(String(lastUploadValue), 10);
+      if (!isNaN(parsed)) lastUploadMs = parsed;
+    }
+    var FIVE_MINUTES_MS = 5 * 60 * 1000;
+    if (lastUploadMs && nowMs - lastUploadMs < FIVE_MINUTES_MS) {
+      resolve();
+      return;
+    }
+
     var uploadedIds = [];
     var failedIds = [];
-    var nowMs = Date.now();
 
     for (var i = 0; i < pending.length; i++) {
       var loc = pending[i];
@@ -46,15 +63,19 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
       var timestampStr = new Date(loc.timestamp).toISOString();
       
       var docId = loc.id;
-      var body = JSON.stringify({
-        fields: {
-          user_id: { stringValue: loc.user_id },
-          latitude: { doubleValue: loc.latitude },
-          longitude: { doubleValue: loc.longitude },
-          timestamp: { timestampValue: timestampStr },
-          wait_time: { integerValue: String(Math.round(effectiveWaitTime)) },
-        },
-      });
+      var fields = {
+        user_id: { stringValue: loc.user_id },
+        latitude: { doubleValue: loc.latitude },
+        longitude: { doubleValue: loc.longitude },
+        timestamp: { timestampValue: timestampStr },
+        wait_time: { integerValue: String(Math.round(effectiveWaitTime)) },
+      };
+      if (loc.trip_ids && Array.isArray(loc.trip_ids) && loc.trip_ids.length > 0) {
+        fields.trip_ids = { arrayValue: { values: loc.trip_ids.map(function (tripId) {
+          return { stringValue: tripId };
+        }) } };
+      }
+      var body = JSON.stringify({ fields: fields });
 
       var url = baseUrl + "?documentId=" + encodeURIComponent(docId);
       try {
@@ -83,6 +104,7 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
     // Mark successfully uploaded IDs so main app can remove them from IndexedDB
     if (uploadedIds.length > 0) {
       CapacitorKV.set(uploadedIdsKey, JSON.stringify(uploadedIds));
+      CapacitorKV.set(lastUploadKey, String(nowMs));
     }
 
     // If all uploads succeeded, clear pending from Preferences

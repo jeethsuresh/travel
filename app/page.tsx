@@ -9,6 +9,8 @@ import FriendsPanel from "@/components/FriendsPanel";
 import LocationHistory from "@/components/LocationHistory";
 import PhotoGallery from "@/components/PhotoGallery";
 import UserProfilePanel from "@/components/UserProfilePanel";
+import TripsPanel from "@/components/TripsPanel";
+import TripDetailView from "@/components/TripDetailView";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -23,9 +25,11 @@ import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocat
 import { subscribeUserSettings } from "@/lib/userSettings";
 import { subscribeSharedLocationsForUser } from "@/lib/sharedLocations";
 import { updateMySharedLocation } from "@/lib/sharedLocations";
+import { subscribeTrips, getActiveTrips, type Trip } from "@/lib/firebase/trips";
 import { isNativePlatform } from "@/lib/capacitor";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
+import { scanForNewPhotos, shouldScanForPhotos } from "@/lib/photoScanner";
 import type { MapHandle } from "@/components/Map";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
@@ -99,7 +103,10 @@ export default function Home() {
   const [locationHistoryOpen, setLocationHistoryOpen] = useState(false);
   const [photosPanelOpen, setPhotosPanelOpen] = useState(false);
   const [friendsPanelOpen, setFriendsPanelOpen] = useState(false);
+  const [tripsPanelOpen, setTripsPanelOpen] = useState(false);
   const [profilePanelOpen, setProfilePanelOpen] = useState(false);
+  const [selectedTrip, setSelectedTrip] = useState<Trip | null>(null);
+  const [activeTrips, setActiveTrips] = useState<Trip[]>([]);
   const [userDisplayName, setUserDisplayName] = useState("");
   const [friendLocations, setFriendLocations] = useState<Array<{ user_id: string; display_name: string; lat: number; lng: number; timestamp: string; wait_time?: number }>>([]);
 
@@ -358,6 +365,30 @@ export default function Home() {
     return () => unsub();
   }, [user?.id]);
 
+  // Subscribe to trips and update active trips
+  useEffect(() => {
+    if (!user?.id) {
+      setActiveTrips([]);
+      return;
+    }
+    try {
+      const unsubscribe = subscribeTrips(user.id, async (trips) => {
+        try {
+          const active = await getActiveTrips(user.id);
+          setActiveTrips(active);
+        } catch (error) {
+          console.error("[App] Error getting active trips:", error);
+          setActiveTrips([]);
+        }
+      });
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("[App] Error subscribing to trips:", error);
+      setActiveTrips([]);
+      return () => {};
+    }
+  }, [user?.id]);
+
   const handleLocationSaved = useCallback(
     async (lat: number, lng: number, timestamp: string, waitTime?: number) => {
       if (!user?.id) return;
@@ -381,11 +412,17 @@ export default function Home() {
   }, [user?.id, userDisplayName, locations.length, locations[0]?.timestamp]);
 
   // On app active: apply uploadedIds from runner (remove from IndexedDB and refetch)
+  // Also scan for new photos from device library
   useEffect(() => {
     if (!isNativePlatform()) return;
+    
+    // Track if this is the first activation to avoid scanning on initial load
+    let isFirstActivation = true;
+    
     const listenerPromise = App.addListener("appStateChange", async (state) => {
       if (state.isActive) {
         try {
+          // Handle location uploads from background runner
           const { value } = await Preferences.get({ key: "jeethtravel.uploadedIds" });
           if (value) {
             const ids = JSON.parse(value) as string[];
@@ -393,6 +430,29 @@ export default function Home() {
             await Preferences.remove({ key: "jeethtravel.uploadedIds" });
             fetchLocations();
           }
+
+          // Scan for new photos from device library (skip on first activation to avoid blocking app startup)
+          if (user?.id && !isFirstActivation) {
+            const shouldScan = await shouldScanForPhotos();
+            if (shouldScan) {
+              // Small delay to let the app fully come to foreground
+              setTimeout(async () => {
+                try {
+                  const addedCount = await scanForNewPhotos(user.id);
+                  if (addedCount > 0) {
+                    // Refresh photos list and map if new photos were added
+                    fetchPhotos();
+                    fetchLocations(); // Refresh locations in case photos have GPS data
+                  }
+                } catch (error) {
+                  console.warn("[PhotoScanner] Error scanning photos on foreground:", error);
+                }
+              }, 1000); // Increased delay to ensure app is fully ready
+            }
+          }
+          
+          // Mark that we've handled the first activation
+          isFirstActivation = false;
         } catch (e) {
           console.warn("[Location:uploadedIds] apply failed", e);
         }
@@ -403,7 +463,7 @@ export default function Home() {
     return () => {
       listenerPromise.then((l) => l.remove()).catch(() => {});
     };
-  }, [syncPendingToPreferencesForRunner, fetchLocations]);
+  }, [syncPendingToPreferencesForRunner, fetchLocations, fetchPhotos, user?.id]);
 
   useEffect(() => {
     return () => {
@@ -460,6 +520,24 @@ export default function Home() {
           onLocationSaved={handleLocationSaved}
         />
       </div>
+
+      {/* Top-center: Active trips display */}
+      {user && activeTrips.length > 0 && (
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 z-10 p-3 safe-area-top">
+          <Card className="border-border/80 bg-card/95 shadow-lg backdrop-blur-sm">
+            <CardContent className="pt-3 px-4 pb-3">
+              <div className="flex items-center gap-2 flex-wrap justify-center">
+                <span className="text-xs text-muted-foreground">Active trips:</span>
+                {activeTrips.map((trip) => (
+                  <span key={trip.id} className="text-xs font-medium px-2 py-1 bg-primary/10 text-primary rounded">
+                    {trip.name}
+                  </span>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* Top-left: map title + navigation (only when signed in) */}
       {user && (
@@ -546,13 +624,13 @@ export default function Home() {
         </div>
       )}
 
-      {/* Right side: Photos + Friends buttons */}
+      {/* Right side: Photos + Friends + Trips buttons */}
       {user && (
         <div className="absolute top-1/2 right-0 z-10 flex flex-col gap-2 -translate-y-1/2 p-2 pr-[max(0.5rem,env(safe-area-inset-right))]">
           <Button
             variant="secondary"
             className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
-            onClick={() => { setPhotosPanelOpen(true); setFriendsPanelOpen(false); }}
+            onClick={() => { setPhotosPanelOpen(true); setFriendsPanelOpen(false); setTripsPanelOpen(false); }}
             title="Photos"
           >
             <span className="text-xl">📷</span>
@@ -561,11 +639,20 @@ export default function Home() {
           <Button
             variant="secondary"
             className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
-            onClick={() => { setFriendsPanelOpen(true); setPhotosPanelOpen(false); }}
+            onClick={() => { setFriendsPanelOpen(true); setPhotosPanelOpen(false); setTripsPanelOpen(false); }}
             title="Friends"
           >
             <span className="text-xl">👥</span>
             <span className="text-xs font-medium">Friends</span>
+          </Button>
+          <Button
+            variant="secondary"
+            className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
+            onClick={() => { setTripsPanelOpen(true); setPhotosPanelOpen(false); setFriendsPanelOpen(false); }}
+            title="Trips"
+          >
+            <span className="text-xl">✈️</span>
+            <span className="text-xs font-medium">Trips</span>
           </Button>
         </div>
       )}
@@ -660,6 +747,39 @@ export default function Home() {
                 userDisplayName={userDisplayName}
                 open={friendsPanelOpen}
               />
+            </div>
+          </SheetContent>
+        </Sheet>
+      )}
+
+      {/* Trips panel (Sheet from right) */}
+      {user && (
+        <Sheet open={tripsPanelOpen} onOpenChange={setTripsPanelOpen}>
+          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0" onOpenChange={setTripsPanelOpen}>
+            <SheetHeader className="p-4 pt-12 pr-12 border-b border-border">
+              <SheetTitle>Trips</SheetTitle>
+            </SheetHeader>
+            <div className="flex-1 overflow-y-auto p-4">
+              {selectedTrip ? (
+                <TripDetailView
+                  user={user}
+                  trip={selectedTrip}
+                  onClose={() => setSelectedTrip(null)}
+                  onTripDeleted={() => {
+                    setSelectedTrip(null);
+                    getActiveTrips(user.id).then(setActiveTrips);
+                  }}
+                  onTripUpdated={() => {
+                    getActiveTrips(user.id).then(setActiveTrips);
+                  }}
+                />
+              ) : (
+                <TripsPanel
+                  user={user}
+                  open={tripsPanelOpen}
+                  onTripSelect={(trip) => setSelectedTrip(trip)}
+                />
+              )}
             </div>
           </SheetContent>
         </Sheet>

@@ -15,6 +15,7 @@ Location points (lat/lng + time). Synced from local pending queue.
 | `longitude` | number   | yes      | Longitude. |
 | `timestamp` | Timestamp | yes     | When the location was recorded (ISO string or Firestore Timestamp). |
 | `wait_time` | number   | no       | Seconds waited at this location (default 0). |
+| `trip_ids`  | array of strings | no | Array of trip IDs this location belongs to. |
 | `created_at`| Timestamp | no      | Server/client write time. |
 
 **Document ID:** Auto-generated (e.g. `addDoc`).
@@ -34,6 +35,7 @@ Photo metadata only (no image bytes). Images are stored locally; this collection
 | `latitude`  | number \| null | no  | Latitude from EXIF or manual. |
 | `longitude` | number \| null | no  | Longitude from EXIF or manual. |
 | `timestamp` | string | yes      | When the photo was taken (ISO string). |
+| `trip_ids`  | array of strings | no | Array of trip IDs this photo belongs to. |
 | `created_at`| string | yes      | When the record was created (ISO string). |
 
 **Document ID:** Same as the local photo id (e.g. `photo_123_abc`) for easy delete/merge.
@@ -73,10 +75,30 @@ Bidirectional friendship links. Two documents per pair (A→B and B→A) so each
 
 ---
 
+## `trips`
+
+Trips group locations and photos into named journeys with date ranges.
+
+| Field        | Type     | Required | Description |
+|-------------|----------|----------|-------------|
+| `user_id`   | string   | yes      | Firebase Auth UID of the owner. |
+| `name`      | string   | yes      | Trip name. |
+| `start_date`| string   | yes      | ISO date string for trip start. |
+| `end_date`  | string   | yes      | ISO date string for trip end. |
+| `is_active` | boolean  | yes      | Whether trip is currently toggled on (manually activated). |
+| `created_at`| string   | yes      | ISO timestamp when trip was created. |
+
+**Document ID:** Auto-generated.
+
+**Indexes:** None required for current queries (`user_id` is used; composite index may be created by Firebase when needed).
+
+---
+
 ## Security
 
 See `firestore.rules` for access control. In short:
 
 - **locations, photos:** Read/write only when `user_id == request.auth.uid`.
+- **trips:** Read/write only when `user_id == request.auth.uid`.
 - **friend_requests:** Requester and recipient can read; only requester can create/delete; only recipient can update (accept/reject).
 - **friendships:** Users can read/write only the row where `user_id == request.auth.uid`.
