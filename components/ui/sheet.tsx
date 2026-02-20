@@ -85,29 +85,34 @@ const SheetContent = React.forwardRef<
     const absDeltaX = Math.abs(deltaX);
     const absDeltaY = Math.abs(deltaY);
 
-    // Determine swipe direction based on sheet side
+    // Determine swipe direction based on sheet side - allow swiping in the close direction
     let shouldSwipe = false;
-    if (side === "right" && deltaX > 0 && absDeltaX > absDeltaY && absDeltaX > 50) {
+    if (side === "right" && deltaX > 0 && absDeltaX > absDeltaY) {
       shouldSwipe = true;
-    } else if (side === "left" && deltaX < 0 && absDeltaX > absDeltaY && absDeltaX > 50) {
+    } else if (side === "left" && deltaX < 0 && absDeltaX > absDeltaY) {
       shouldSwipe = true;
-    } else if (side === "bottom" && deltaY > 0 && absDeltaY > absDeltaX && absDeltaY > 50) {
+    } else if (side === "bottom" && deltaY > 0 && absDeltaY > absDeltaX) {
       shouldSwipe = true;
-    } else if (side === "top" && deltaY < 0 && absDeltaY > absDeltaX && absDeltaY > 50) {
+    } else if (side === "top" && deltaY < 0 && absDeltaY > absDeltaX) {
       shouldSwipe = true;
     }
 
     if (shouldSwipe) {
-      // Apply visual feedback during swipe
+      // Apply visual feedback during swipe - only allow movement in close direction
       const translateX = side === "right" ? Math.max(0, deltaX) : side === "left" ? Math.min(0, deltaX) : 0;
       const translateY = side === "bottom" ? Math.max(0, deltaY) : side === "top" ? Math.min(0, deltaY) : 0;
       contentRef.current.style.transform = `translate(${translateX}px, ${translateY}px)`;
       contentRef.current.style.transition = "none";
+      // Prevent scrolling while swiping
+      e.preventDefault();
     }
   }, [side]);
 
   const handleTouchEnd = React.useCallback((e: React.TouchEvent) => {
-    if (!touchStartRef.current || !contentRef.current) return;
+    if (!touchStartRef.current || !contentRef.current) {
+      touchStartRef.current = null;
+      return;
+    }
 
     const touch = e.changedTouches[0];
     const deltaX = touch.clientX - touchStartRef.current.x;
@@ -115,37 +120,55 @@ const SheetContent = React.forwardRef<
     const absDeltaX = Math.abs(deltaX);
     const absDeltaY = Math.abs(deltaY);
     const duration = Date.now() - touchStartTimeRef.current;
-    const velocity = Math.sqrt(deltaX * deltaX + deltaY * deltaY) / duration;
-
-    // Reset transform
-    contentRef.current.style.transform = "";
-    contentRef.current.style.transition = "";
+    const velocity = duration > 0 ? Math.sqrt(deltaX * deltaX + deltaY * deltaY) / duration : 0;
 
     // Determine if swipe should close the sheet
     let shouldClose = false;
-    const threshold = 100; // Minimum distance
-    const velocityThreshold = 0.3; // Minimum velocity (px/ms)
+    const threshold = 80; // Minimum distance (lowered for easier triggering)
+    const velocityThreshold = 0.25; // Minimum velocity (px/ms) - lowered for easier triggering
+    const minDistance = 30; // Minimum movement to consider it a swipe
+
+    // Check if we have enough movement in the right direction
+    if (absDeltaX < minDistance && absDeltaY < minDistance) {
+      // Not enough movement - reset and return
+      contentRef.current.style.transform = "";
+      contentRef.current.style.transition = "";
+      touchStartRef.current = null;
+      return;
+    }
 
     if (side === "right" && deltaX > threshold && absDeltaX > absDeltaY) {
       shouldClose = true;
-    } else if (side === "right" && velocity > velocityThreshold && deltaX > 0 && absDeltaX > absDeltaY) {
+    } else if (side === "right" && velocity > velocityThreshold && deltaX > 0 && absDeltaX > absDeltaY && absDeltaX > minDistance) {
       shouldClose = true;
     } else if (side === "left" && deltaX < -threshold && absDeltaX > absDeltaY) {
       shouldClose = true;
-    } else if (side === "left" && velocity > velocityThreshold && deltaX < 0 && absDeltaX > absDeltaY) {
+    } else if (side === "left" && velocity > velocityThreshold && deltaX < 0 && absDeltaX > absDeltaY && absDeltaX > minDistance) {
       shouldClose = true;
     } else if (side === "bottom" && deltaY > threshold && absDeltaY > absDeltaX) {
       shouldClose = true;
-    } else if (side === "bottom" && velocity > velocityThreshold && deltaY > 0 && absDeltaY > absDeltaX) {
+    } else if (side === "bottom" && velocity > velocityThreshold && deltaY > 0 && absDeltaY > absDeltaX && absDeltaY > minDistance) {
       shouldClose = true;
     } else if (side === "top" && deltaY < -threshold && absDeltaY > absDeltaX) {
       shouldClose = true;
-    } else if (side === "top" && velocity > velocityThreshold && deltaY < 0 && absDeltaY > absDeltaX) {
+    } else if (side === "top" && velocity > velocityThreshold && deltaY < 0 && absDeltaY > absDeltaX && absDeltaY > minDistance) {
       shouldClose = true;
     }
 
     if (shouldClose && onOpenChange) {
+      // Close the sheet - Radix UI will handle the animation
+      // Don't reset transform - let Radix UI's close animation take over
       onOpenChange(false);
+    } else {
+      // Animate back smoothly if not closing
+      contentRef.current.style.transition = "transform 0.2s ease-out";
+      contentRef.current.style.transform = "";
+      // Reset transition after animation completes
+      setTimeout(() => {
+        if (contentRef.current) {
+          contentRef.current.style.transition = "";
+        }
+      }, 200);
     }
 
     touchStartRef.current = null;
