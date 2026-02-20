@@ -64,6 +64,7 @@ interface PhotoWithLocation {
 
 export default function Home() {
   const LOCATIONS_PAGE_SIZE = 50;
+  const componentMountTime = useRef(Date.now());
 
   const [user, setUser] = useState<User | null>(null);
   const [remoteLocations, setRemoteLocations] = useState<Location[]>([]);
@@ -109,9 +110,11 @@ export default function Home() {
   const [activeTrips, setActiveTrips] = useState<Trip[]>([]);
   const [userDisplayName, setUserDisplayName] = useState("");
   const [friendLocations, setFriendLocations] = useState<Array<{ user_id: string; display_name: string; lat: number; lng: number; timestamp: string; wait_time?: number }>>([]);
+  const lastSharedLocationTimestampRef = useRef<string | null>(null);
 
   // Firebase auth state: require login
   useEffect(() => {
+    const effectStartTime = Date.now();
     console.log("[App] Initializing Firebase auth...");
     console.log("[App] Environment check:", {
       hasApiKey: !!process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -122,7 +125,8 @@ export default function Home() {
     });
 
     const auth = getFirebaseAuth();
-    console.log("[App] getFirebaseAuth() returned:", auth ? "Auth instance" : "null");
+    const authElapsed = Date.now() - effectStartTime;
+    console.log(`[App] getFirebaseAuth() returned in ${authElapsed}ms:`, auth ? "Auth instance" : "null");
     
     if (!auth) {
       console.warn("[App] Firebase auth not available, setting loading to false");
@@ -132,10 +136,13 @@ export default function Home() {
 
     console.log("[App] Setting up onAuthStateChanged listener...");
     let authStateResolved = false;
+    const listenerStartTime = Date.now();
+    
     const unsub = onAuthStateChanged(
       auth,
       (firebaseUser) => {
-        console.log("[App] Auth state changed:", {
+        const listenerElapsed = Date.now() - listenerStartTime;
+        console.log(`[App] Auth state changed after ${listenerElapsed}ms:`, {
           hasUser: !!firebaseUser,
           uid: firebaseUser?.uid,
           email: firebaseUser?.email,
@@ -154,7 +161,8 @@ export default function Home() {
         console.log("[App] Loading set to false after auth state change");
       },
       (error) => {
-        console.error("[App] Auth state change error:", error);
+        const listenerElapsed = Date.now() - listenerStartTime;
+        console.error(`[App] Auth state change error after ${listenerElapsed}ms:`, error);
         authStateResolved = true;
         setLoading(false);
       }
@@ -163,7 +171,8 @@ export default function Home() {
     // Fallback timeout: if auth state doesn't resolve within 5 seconds, stop loading
     const timeoutId = setTimeout(() => {
       if (!authStateResolved) {
-        console.warn("[App] Auth state change timeout - forcing loading to false");
+        const elapsed = Date.now() - listenerStartTime;
+        console.warn(`[App] Auth state change timeout after ${elapsed}ms - forcing loading to false`);
         setLoading(false);
       }
     }, 5000);
@@ -399,8 +408,16 @@ export default function Home() {
 
   // When we have locations and share with friends, keep shared_locations in sync (e.g. after toggle or load)
   useEffect(() => {
-    if (!user?.id || locations.length === 0) return;
+    if (!user?.id || locations.length === 0) {
+      lastSharedLocationTimestampRef.current = null;
+      return;
+    }
     const latest = locations[0];
+    // Only update if the timestamp actually changed to prevent infinite loops
+    if (lastSharedLocationTimestampRef.current === latest.timestamp) {
+      return;
+    }
+    lastSharedLocationTimestampRef.current = latest.timestamp;
     updateMySharedLocation(
       user.id,
       userDisplayName,
@@ -408,16 +425,21 @@ export default function Home() {
       latest.longitude,
       latest.timestamp,
       latest.wait_time
-    ).catch(() => {});
+    ).catch(() => {
+      // Reset ref on error so we can retry
+      lastSharedLocationTimestampRef.current = null;
+    });
   }, [user?.id, userDisplayName, locations.length, locations[0]?.timestamp]);
 
   // On app active: apply uploadedIds from runner (remove from IndexedDB and refetch)
   // Also scan for new photos from device library
   useEffect(() => {
-    if (!isNativePlatform()) return;
+    if (!isNativePlatform()) {
+      return;
+    }
     
     // Track if this is the first activation to avoid scanning on initial load
-    let isFirstActivation = true;
+    const isFirstActivationRef = { current: true };
     
     const listenerPromise = App.addListener("appStateChange", async (state) => {
       if (state.isActive) {
@@ -432,7 +454,7 @@ export default function Home() {
           }
 
           // Scan for new photos from device library (skip on first activation to avoid blocking app startup)
-          if (user?.id && !isFirstActivation) {
+          if (user?.id && !isFirstActivationRef.current) {
             const shouldScan = await shouldScanForPhotos();
             if (shouldScan) {
               // Small delay to let the app fully come to foreground
@@ -452,7 +474,7 @@ export default function Home() {
           }
           
           // Mark that we've handled the first activation
-          isFirstActivation = false;
+          isFirstActivationRef.current = false;
         } catch (e) {
           console.warn("[Location:uploadedIds] apply failed", e);
         }
@@ -472,8 +494,23 @@ export default function Home() {
     };
   }, []);
 
+  // Log startup summary when component finishes initializing (only once)
+  useEffect(() => {
+    if (loading) return; // Wait until loading is complete
+    const totalTime = Date.now() - componentMountTime.current;
+    console.log(`[STARTUP:SUMMARY] Component initialization completed in ${totalTime}ms`);
+    console.log("[STARTUP:SUMMARY] Current state:", {
+      hasUser: !!user,
+      userId: user?.id,
+      locationCount: locations.length,
+      photoCount: photos.length,
+      isNative: isNativePlatform(),
+    });
+  }, [loading]); // Only depend on loading to log once when it becomes false
+
   if (loading) {
-    console.log("[App] Rendering loading screen", {
+    const elapsed = Date.now() - componentMountTime.current;
+    console.log(`[RENDER:${elapsed}ms] Rendering loading screen`, {
       hasUser: !!user,
       isNative: isNativePlatform(),
     });
@@ -491,7 +528,8 @@ export default function Home() {
     );
   }
 
-  console.log("[App] Rendering main app", {
+  const renderElapsed = Date.now() - componentMountTime.current;
+  console.log(`[RENDER:${renderElapsed}ms] Rendering main app`, {
     hasUser: !!user,
     loading,
     locationCount: locations.length,

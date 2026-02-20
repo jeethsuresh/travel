@@ -17,20 +17,49 @@ const firebaseConfig = {
 
 // Initialize Firebase app (singleton pattern)
 let app: FirebaseApp;
+const initStartTime = typeof window !== "undefined" ? Date.now() : 0;
+
 if (typeof window !== "undefined") {
+  console.log("[Firebase:Client] Initializing Firebase client", {
+    existingApps: getApps().length,
+    hasApiKey: !!firebaseConfig.apiKey,
+    hasProjectId: !!firebaseConfig.projectId,
+    hasAuthDomain: !!firebaseConfig.authDomain,
+  });
+  
   if (getApps().length === 0) {
+    console.log("[Firebase:Client] No existing apps - initializing new Firebase app");
+    const initTime = Date.now();
     app = initializeApp(firebaseConfig);
+    const elapsed = Date.now() - initTime;
+    console.log(`[Firebase:Client] Firebase app initialized in ${elapsed}ms`);
   } else {
+    console.log("[Firebase:Client] Using existing Firebase app");
     app = getApps()[0];
+  }
+  
+  if (initStartTime > 0) {
+    const totalElapsed = Date.now() - initStartTime;
+    console.log(`[Firebase:Client] Total Firebase client initialization took ${totalElapsed}ms`);
   }
 } else {
   // Server-side: return a placeholder that will be initialized on client
+  console.log("[Firebase:Client] Server-side - returning placeholder");
   app = {} as FirebaseApp;
 }
 
 // Initialize services (no Storage; photos are stored locally, metadata in Firestore)
+const serviceInitStart = typeof window !== "undefined" ? Date.now() : 0;
 export const auth: Auth = typeof window !== "undefined" ? getAuth(app) : ({} as Auth);
 export const db: Firestore = typeof window !== "undefined" ? getFirestore(app) : ({} as Firestore);
+
+if (typeof window !== "undefined" && serviceInitStart > 0) {
+  const serviceElapsed = Date.now() - serviceInitStart;
+  console.log(`[Firebase:Client] Auth and Firestore services initialized in ${serviceElapsed}ms`, {
+    authAvailable: !!auth,
+    dbAvailable: !!db,
+  });
+}
 
 export function createClient() {
   return {
