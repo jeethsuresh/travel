@@ -68,7 +68,7 @@ export default function UserProfilePanel({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="flex flex-col p-0">
+      <SheetContent side="right" className="flex flex-col p-0" onOpenChange={onOpenChange}>
         <SheetHeader className="p-4 pt-12 pr-12 border-b border-border">
           <SheetTitle>User profile</SheetTitle>
           <SheetDescription>Account and preferences</SheetDescription>

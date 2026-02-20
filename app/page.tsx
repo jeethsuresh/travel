@@ -576,6 +576,7 @@ export default function Home() {
           <SheetContent
             side="bottom"
             className="max-h-[85vh] flex flex-col"
+            onOpenChange={setLocationHistoryOpen}
           >
             <SheetHeader className="pt-12 pr-12">
               <SheetTitle>Location history</SheetTitle>
@@ -626,7 +627,7 @@ export default function Home() {
       {/* Photos panel (Sheet from right) */}
       {user && (
         <Sheet open={photosPanelOpen} onOpenChange={setPhotosPanelOpen}>
-          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0">
+          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0" onOpenChange={setPhotosPanelOpen}>
             <SheetHeader className="p-4 pt-12 pr-12 border-b border-border">
               <SheetTitle>Photos</SheetTitle>
             </SheetHeader>
@@ -649,7 +650,7 @@ export default function Home() {
       {/* Friends panel (Sheet from right) */}
       {user && (
         <Sheet open={friendsPanelOpen} onOpenChange={setFriendsPanelOpen}>
-          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0">
+          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0" onOpenChange={setFriendsPanelOpen}>
             <SheetHeader className="p-4 pt-12 pr-12 border-b border-border">
               <SheetTitle>Friends</SheetTitle>
             </SheetHeader>
