@@ -2,13 +2,15 @@
 
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { collection, query, where, orderBy, limit, startAfter, getDocs, type DocumentSnapshot } from "firebase/firestore";
+import { collection, query, where, orderBy, limit, startAfter, getDocs, Timestamp, type DocumentSnapshot } from "firebase/firestore";
 import dynamicImport from "next/dynamic";
 import Auth from "@/components/Auth";
 import FriendsPanel from "@/components/FriendsPanel";
 import LocationHistory from "@/components/LocationHistory";
 import PhotoGallery from "@/components/PhotoGallery";
 import UserProfilePanel from "@/components/UserProfilePanel";
+import TripsPanel from "@/components/TripsPanel";
+import TripDetailView from "@/components/TripDetailView";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -23,6 +25,7 @@ import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocat
 import { subscribeUserSettings } from "@/lib/userSettings";
 import { subscribeSharedLocationsForUser } from "@/lib/sharedLocations";
 import { updateMySharedLocation } from "@/lib/sharedLocations";
+import { subscribeTrips, getActiveTrips, type Trip } from "@/lib/firebase/trips";
 import { isNativePlatform } from "@/lib/capacitor";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
@@ -40,6 +43,7 @@ interface Location {
   longitude: number;
   timestamp: string;
   wait_time?: number;
+  trip_ids?: string[];
 }
 
 interface Photo {
@@ -60,6 +64,7 @@ interface PhotoWithLocation {
 
 export default function Home() {
   const LOCATIONS_PAGE_SIZE = 50;
+  const componentMountTime = useRef(Date.now());
 
   const [user, setUser] = useState<User | null>(null);
   const [remoteLocations, setRemoteLocations] = useState<Location[]>([]);
@@ -99,12 +104,17 @@ export default function Home() {
   const [locationHistoryOpen, setLocationHistoryOpen] = useState(false);
   const [photosPanelOpen, setPhotosPanelOpen] = useState(false);
   const [friendsPanelOpen, setFriendsPanelOpen] = useState(false);
+  const [tripsPanelOpen, setTripsPanelOpen] = useState(false);
   const [profilePanelOpen, setProfilePanelOpen] = useState(false);
+  const [selectedTrip, setSelectedTrip] = useState<Trip | null>(null);
+  const [activeTrips, setActiveTrips] = useState<Trip[]>([]);
   const [userDisplayName, setUserDisplayName] = useState("");
   const [friendLocations, setFriendLocations] = useState<Array<{ user_id: string; display_name: string; lat: number; lng: number; timestamp: string; wait_time?: number }>>([]);
+  const lastSharedLocationTimestampRef = useRef<string | null>(null);
 
   // Firebase auth state: require login
   useEffect(() => {
+    const effectStartTime = Date.now();
     console.log("[App] Initializing Firebase auth...");
     console.log("[App] Environment check:", {
       hasApiKey: !!process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -115,7 +125,8 @@ export default function Home() {
     });
 
     const auth = getFirebaseAuth();
-    console.log("[App] getFirebaseAuth() returned:", auth ? "Auth instance" : "null");
+    const authElapsed = Date.now() - effectStartTime;
+    console.log(`[App] getFirebaseAuth() returned in ${authElapsed}ms:`, auth ? "Auth instance" : "null");
     
     if (!auth) {
       console.warn("[App] Firebase auth not available, setting loading to false");
@@ -125,10 +136,13 @@ export default function Home() {
 
     console.log("[App] Setting up onAuthStateChanged listener...");
     let authStateResolved = false;
+    const listenerStartTime = Date.now();
+    
     const unsub = onAuthStateChanged(
       auth,
       (firebaseUser) => {
-        console.log("[App] Auth state changed:", {
+        const listenerElapsed = Date.now() - listenerStartTime;
+        console.log(`[App] Auth state changed after ${listenerElapsed}ms:`, {
           hasUser: !!firebaseUser,
           uid: firebaseUser?.uid,
           email: firebaseUser?.email,
@@ -147,7 +161,8 @@ export default function Home() {
         console.log("[App] Loading set to false after auth state change");
       },
       (error) => {
-        console.error("[App] Auth state change error:", error);
+        const listenerElapsed = Date.now() - listenerStartTime;
+        console.error(`[App] Auth state change error after ${listenerElapsed}ms:`, error);
         authStateResolved = true;
         setLoading(false);
       }
@@ -156,7 +171,8 @@ export default function Home() {
     // Fallback timeout: if auth state doesn't resolve within 5 seconds, stop loading
     const timeoutId = setTimeout(() => {
       if (!authStateResolved) {
-        console.warn("[App] Auth state change timeout - forcing loading to false");
+        const elapsed = Date.now() - listenerStartTime;
+        console.warn(`[App] Auth state change timeout after ${elapsed}ms - forcing loading to false`);
         setLoading(false);
       }
     }, 5000);
@@ -207,8 +223,11 @@ export default function Home() {
             id: doc.id,
             latitude: d.latitude ?? 0,
             longitude: d.longitude ?? 0,
-            timestamp: d.timestamp ?? "",
+            timestamp: d.timestamp instanceof Timestamp
+              ? d.timestamp.toDate().toISOString()
+              : String(d.timestamp ?? ""),
             wait_time: d.wait_time,
+            trip_ids: d.trip_ids,
           });
         });
         newLastVisible = firestoreSnap.docs[firestoreSnap.docs.length - 1];
@@ -223,6 +242,7 @@ export default function Home() {
         longitude: p.longitude,
         timestamp: p.timestamp,
         wait_time: p.wait_time,
+        trip_ids: p.trip_ids,
       }));
       setPendingLocations(pendingAsLocations);
     } catch (error) {
@@ -257,8 +277,11 @@ export default function Home() {
           id: doc.id,
           latitude: d.latitude ?? 0,
           longitude: d.longitude ?? 0,
-          timestamp: d.timestamp ?? "",
+          timestamp: d.timestamp instanceof Timestamp
+            ? d.timestamp.toDate().toISOString()
+            : String(d.timestamp ?? ""),
           wait_time: d.wait_time,
+          trip_ids: d.trip_ids,
         });
       });
       setRemoteLocations((prev) => [...prev, ...next]);
@@ -358,6 +381,30 @@ export default function Home() {
     return () => unsub();
   }, [user?.id]);
 
+  // Subscribe to trips and update active trips
+  useEffect(() => {
+    if (!user?.id) {
+      setActiveTrips([]);
+      return;
+    }
+    try {
+      const unsubscribe = subscribeTrips(user.id, async (trips) => {
+        try {
+          const active = await getActiveTrips(user.id);
+          setActiveTrips(active);
+        } catch (error) {
+          console.error("[App] Error getting active trips:", error);
+          setActiveTrips([]);
+        }
+      });
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("[App] Error subscribing to trips:", error);
+      setActiveTrips([]);
+      return () => {};
+    }
+  }, [user?.id]);
+
   const handleLocationSaved = useCallback(
     async (lat: number, lng: number, timestamp: string, waitTime?: number) => {
       if (!user?.id) return;
@@ -368,8 +415,16 @@ export default function Home() {
 
   // When we have locations and share with friends, keep shared_locations in sync (e.g. after toggle or load)
   useEffect(() => {
-    if (!user?.id || locations.length === 0) return;
+    if (!user?.id || locations.length === 0) {
+      lastSharedLocationTimestampRef.current = null;
+      return;
+    }
     const latest = locations[0];
+    // Only update if the timestamp actually changed to prevent infinite loops
+    if (lastSharedLocationTimestampRef.current === latest.timestamp) {
+      return;
+    }
+    lastSharedLocationTimestampRef.current = latest.timestamp;
     updateMySharedLocation(
       user.id,
       userDisplayName,
@@ -377,15 +432,22 @@ export default function Home() {
       latest.longitude,
       latest.timestamp,
       latest.wait_time
-    ).catch(() => {});
+    ).catch(() => {
+      // Reset ref on error so we can retry
+      lastSharedLocationTimestampRef.current = null;
+    });
   }, [user?.id, userDisplayName, locations.length, locations[0]?.timestamp]);
 
   // On app active: apply uploadedIds from runner (remove from IndexedDB and refetch)
   useEffect(() => {
-    if (!isNativePlatform()) return;
+    if (!isNativePlatform()) {
+      return;
+    }
+    
     const listenerPromise = App.addListener("appStateChange", async (state) => {
       if (state.isActive) {
         try {
+          // Handle location uploads from background runner
           const { value } = await Preferences.get({ key: "jeethtravel.uploadedIds" });
           if (value) {
             const ids = JSON.parse(value) as string[];
@@ -412,8 +474,23 @@ export default function Home() {
     };
   }, []);
 
+  // Log startup summary when component finishes initializing (only once)
+  useEffect(() => {
+    if (loading) return; // Wait until loading is complete
+    const totalTime = Date.now() - componentMountTime.current;
+    console.log(`[STARTUP:SUMMARY] Component initialization completed in ${totalTime}ms`);
+    console.log("[STARTUP:SUMMARY] Current state:", {
+      hasUser: !!user,
+      userId: user?.id,
+      locationCount: locations.length,
+      photoCount: photos.length,
+      isNative: isNativePlatform(),
+    });
+  }, [loading]); // Only depend on loading to log once when it becomes false
+
   if (loading) {
-    console.log("[App] Rendering loading screen", {
+    const elapsed = Date.now() - componentMountTime.current;
+    console.log(`[RENDER:${elapsed}ms] Rendering loading screen`, {
       hasUser: !!user,
       isNative: isNativePlatform(),
     });
@@ -431,7 +508,8 @@ export default function Home() {
     );
   }
 
-  console.log("[App] Rendering main app", {
+  const renderElapsed = Date.now() - componentMountTime.current;
+  console.log(`[RENDER:${renderElapsed}ms] Rendering main app`, {
     hasUser: !!user,
     loading,
     locationCount: locations.length,
@@ -450,9 +528,11 @@ export default function Home() {
             lng: loc.longitude,
             timestamp: loc.timestamp,
             wait_time: loc.wait_time,
+            trip_ids: loc.trip_ids,
           }))}
           photos={photos}
           friendLocations={friendLocations}
+          trips={activeTrips}
           onLocationUpdate={fetchLocations}
           focusLocation={focusLocation}
           onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
@@ -461,6 +541,7 @@ export default function Home() {
         />
       </div>
 
+
       {/* Top-left: map title + navigation (only when signed in) */}
       {user && (
         <div className="absolute top-0 left-0 z-10 p-3 safe-area-top-left">
@@ -468,30 +549,47 @@ export default function Home() {
             <CardHeader className="pb-2 pt-3 px-3">
               <CardTitle className="text-base font-semibold">Map</CardTitle>
             </CardHeader>
-            <CardContent className="flex items-center gap-1 pt-0 px-3 pb-3">
+            <CardContent className="flex flex-col items-center gap-1 pt-0 px-3 pb-3">
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => mapRef.current?.zoomIn?.()}
+                  aria-label="Zoom in"
+                >
+                  <span className="text-lg font-semibold leading-none">+</span>
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => mapRef.current?.zoomOut?.()}
+                  aria-label="Zoom out"
+                >
+                  <span className="text-lg font-semibold leading-none">−</span>
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => mapRef.current?.flyToCurrentLocation?.()}
+                  aria-label="My location"
+                >
+                  <span className="text-sm">⌖</span>
+                </Button>
+              </div>
               <Button
-                variant="secondary"
+                variant={trackingState.isTracking ? "destructive" : "secondary"}
                 size="icon"
-                onClick={() => mapRef.current?.zoomIn?.()}
-                aria-label="Zoom in"
+                onClick={() => mapRef.current?.toggleTracking?.()}
+                disabled={trackingState.isRequesting}
+                className={
+                  !trackingState.isTracking && !trackingState.isRequesting
+                    ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                    : ""
+                }
+                aria-label={trackingState.isRequesting ? "Requesting" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
+                title={trackingState.isRequesting ? "Requesting…" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
               >
-                <span className="text-lg font-semibold leading-none">+</span>
-              </Button>
-              <Button
-                variant="secondary"
-                size="icon"
-                onClick={() => mapRef.current?.zoomOut?.()}
-                aria-label="Zoom out"
-              >
-                <span className="text-lg font-semibold leading-none">−</span>
-              </Button>
-              <Button
-                variant="secondary"
-                size="icon"
-                onClick={() => mapRef.current?.flyToCurrentLocation?.()}
-                aria-label="My location"
-              >
-                <span className="text-sm">⌖</span>
+                <span className="text-xs">{trackingState.isRequesting ? "…" : trackingState.isTracking ? "⏹" : "▶"}</span>
               </Button>
             </CardContent>
           </Card>
@@ -521,38 +619,44 @@ export default function Home() {
         />
       )}
 
-      {/* Bottom bar: Start tracking + Location History */}
+      {/* Bottom bar: Active trips + Location History */}
       {user && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex justify-center gap-3 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
-          <Button
-            onClick={() => mapRef.current?.toggleTracking?.()}
-            disabled={trackingState.isRequesting}
-            variant={trackingState.isTracking ? "destructive" : "default"}
-            className={
-              !trackingState.isTracking
-                ? "bg-emerald-600 hover:bg-emerald-700 text-white"
-                : ""
-            }
-          >
-            {trackingState.isRequesting ? "Requesting…" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
-          </Button>
-          <Button
-            variant="secondary"
-            className="bg-card/95 shadow-lg backdrop-blur-sm border-border/80"
-            onClick={() => setLocationHistoryOpen(true)}
-          >
-            Location history
-          </Button>
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-2 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
+          {activeTrips.length > 0 && (
+            <div className="flex justify-center">
+              <Card className="border-border/80 bg-card/95 shadow-lg backdrop-blur-sm">
+                <CardContent className="pt-3 px-4 pb-3">
+                  <div className="flex items-center gap-2 flex-wrap justify-center">
+                    <span className="text-xs text-muted-foreground">Active trips:</span>
+                    {activeTrips.map((trip) => (
+                      <span key={trip.id} className="text-xs font-medium px-2 py-1 bg-primary/10 text-primary rounded">
+                        {trip.name}
+                      </span>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          )}
+          <div className="flex justify-center">
+            <Button
+              variant="secondary"
+              className="bg-card/95 shadow-lg backdrop-blur-sm border-border/80"
+              onClick={() => setLocationHistoryOpen(true)}
+            >
+              Location history
+            </Button>
+          </div>
         </div>
       )}
 
-      {/* Right side: Photos + Friends buttons */}
+      {/* Right side: Photos + Friends + Trips buttons */}
       {user && (
         <div className="absolute top-1/2 right-0 z-10 flex flex-col gap-2 -translate-y-1/2 p-2 pr-[max(0.5rem,env(safe-area-inset-right))]">
           <Button
             variant="secondary"
             className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
-            onClick={() => { setPhotosPanelOpen(true); setFriendsPanelOpen(false); }}
+            onClick={() => { setPhotosPanelOpen(true); setFriendsPanelOpen(false); setTripsPanelOpen(false); }}
             title="Photos"
           >
             <span className="text-xl">📷</span>
@@ -561,11 +665,20 @@ export default function Home() {
           <Button
             variant="secondary"
             className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
-            onClick={() => { setFriendsPanelOpen(true); setPhotosPanelOpen(false); }}
+            onClick={() => { setFriendsPanelOpen(true); setPhotosPanelOpen(false); setTripsPanelOpen(false); }}
             title="Friends"
           >
             <span className="text-xl">👥</span>
             <span className="text-xs font-medium">Friends</span>
+          </Button>
+          <Button
+            variant="secondary"
+            className="flex flex-col items-center gap-1 rounded-l-xl rounded-r-md bg-card/95 py-3 px-2 shadow-lg backdrop-blur-sm border border-r-0 border-border h-auto"
+            onClick={() => { setTripsPanelOpen(true); setPhotosPanelOpen(false); setFriendsPanelOpen(false); }}
+            title="Trips"
+          >
+            <span className="text-xl">✈️</span>
+            <span className="text-xs font-medium">Trips</span>
           </Button>
         </div>
       )}
@@ -660,6 +773,39 @@ export default function Home() {
                 userDisplayName={userDisplayName}
                 open={friendsPanelOpen}
               />
+            </div>
+          </SheetContent>
+        </Sheet>
+      )}
+
+      {/* Trips panel (Sheet from right) */}
+      {user && (
+        <Sheet open={tripsPanelOpen} onOpenChange={setTripsPanelOpen}>
+          <SheetContent side="right" className="w-full max-w-md flex flex-col p-0" onOpenChange={setTripsPanelOpen}>
+            <SheetHeader className="p-4 pt-12 pr-12 border-b border-border">
+              <SheetTitle>Trips</SheetTitle>
+            </SheetHeader>
+            <div className="flex-1 overflow-y-auto p-4">
+              {selectedTrip ? (
+                <TripDetailView
+                  user={user}
+                  trip={selectedTrip}
+                  onClose={() => setSelectedTrip(null)}
+                  onTripDeleted={() => {
+                    setSelectedTrip(null);
+                    getActiveTrips(user.id).then(setActiveTrips);
+                  }}
+                  onTripUpdated={() => {
+                    getActiveTrips(user.id).then(setActiveTrips);
+                  }}
+                />
+              ) : (
+                <TripsPanel
+                  user={user}
+                  open={tripsPanelOpen}
+                  onTripSelect={(trip) => setSelectedTrip(trip)}
+                />
+              )}
             </div>
           </SheetContent>
         </Sheet>

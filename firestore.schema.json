@@ -12,6 +12,7 @@
         "longitude": { "type": "number", "required": true },
         "timestamp": { "type": "timestamp", "required": true },
         "wait_time": { "type": "number", "required": false },
+        "trip_ids": { "type": "array", "items": { "type": "string" }, "required": false },
         "created_at": { "type": "timestamp", "required": false }
       }
     },
@@ -24,6 +25,7 @@
         "latitude": { "type": "number|null", "required": false },
         "longitude": { "type": "number|null", "required": false },
         "timestamp": { "type": "string", "required": true },
+        "trip_ids": { "type": "array", "items": { "type": "string" }, "required": false },
         "created_at": { "type": "string", "required": true }
       }
     },
@@ -48,6 +50,18 @@
         "friend_email": { "type": "string", "required": true },
         "share_location_with_friend": { "type": "boolean", "required": true },
         "created_at": { "type": "timestamp", "required": false }
+      }
+    },
+    "trips": {
+      "description": "Trips group locations and photos into named journeys with date ranges",
+      "documentId": "auto",
+      "fields": {
+        "user_id": { "type": "string", "required": true },
+        "name": { "type": "string", "required": true },
+        "start_date": { "type": "string", "required": true },
+        "end_date": { "type": "string", "required": true },
+        "is_active": { "type": "boolean", "required": true },
+        "created_at": { "type": "string", "required": true }
       }
     }
   }

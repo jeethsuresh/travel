@@ -12,6 +12,7 @@ import {
   getPendingPhotosForUser,
   deletePendingPhoto,
 } from "@/lib/localStore";
+import { getTrips, getTripsForTimestamp, type Trip } from "@/lib/firebase/trips";
 
 interface Photo {
   id: string;
@@ -171,12 +172,19 @@ export default function PhotoGallery({ user, onPhotoClick, onPhotosUpdate }: Pho
 
         if (fileId) setUploadProgress((prev) => ({ ...prev, [fileId]: 50 }));
 
+        // Get trips that match this photo's timestamp
+        const timestamp = photoTimestamp ?? new Date().toISOString();
+        const allTrips = await getTrips(user.id);
+        const matchingTrips = getTripsForTimestamp(allTrips, timestamp);
+        const tripIds = matchingTrips.map((trip) => trip.id);
+
         const pending = await addPendingPhoto({
           user_id: user.id,
           latitude: finalLatitude ?? null,
           longitude: finalLongitude ?? null,
-          timestamp: photoTimestamp ?? new Date().toISOString(),
+          timestamp,
           blob: compressedFile,
+          trip_ids: tripIds.length > 0 ? tripIds : undefined,
         });
 
         const localUrl = URL.createObjectURL(compressedFile);

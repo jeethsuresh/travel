@@ -55,10 +55,11 @@ interface SheetContentProps
 const SheetContent = React.forwardRef<
   React.ComponentRef<typeof SheetPrimitive.Content>,
   SheetContentProps
->(({ side = "right", className, children, onOpenChange, ...props }, ref) => {
+>(({ side = "right", className, children, onOpenChange: onOpenChangeProp, ...props }, ref) => {
   const contentRef = React.useRef<HTMLDivElement>(null);
   const touchStartRef = React.useRef<{ x: number; y: number } | null>(null);
   const touchStartTimeRef = React.useRef<number>(0);
+  const closeButtonRef = React.useRef<HTMLButtonElement>(null);
 
   // Determine close button position based on side
   const closeButtonClasses = cn(
@@ -72,32 +73,43 @@ const SheetContent = React.forwardRef<
   // Handle swipe gestures for mobile
   const handleTouchStart = React.useCallback((e: React.TouchEvent) => {
     const touch = e.touches[0];
+    if (!touch) return;
     touchStartRef.current = { x: touch.clientX, y: touch.clientY };
     touchStartTimeRef.current = Date.now();
+    // Store the initial target to check if we should allow scrolling
+    const target = e.target as HTMLElement;
+    const isScrollable = target.closest('[style*="overflow"], [class*="overflow"]');
+    // If starting on a scrollable element, we'll check direction in move handler
   }, []);
 
   const handleTouchMove = React.useCallback((e: React.TouchEvent) => {
     if (!touchStartRef.current || !contentRef.current) return;
     
     const touch = e.touches[0];
+    if (!touch) return;
+    
     const deltaX = touch.clientX - touchStartRef.current.x;
     const deltaY = touch.clientY - touchStartRef.current.y;
     const absDeltaX = Math.abs(deltaX);
     const absDeltaY = Math.abs(deltaY);
 
     // Determine swipe direction based on sheet side - allow swiping in the close direction
+    // Start applying transform at 5px for a more responsive feel
     let shouldSwipe = false;
-    if (side === "right" && deltaX > 0 && absDeltaX > absDeltaY) {
+    if (side === "right" && deltaX > 0 && absDeltaX > absDeltaY && absDeltaX > 5) {
       shouldSwipe = true;
-    } else if (side === "left" && deltaX < 0 && absDeltaX > absDeltaY) {
+    } else if (side === "left" && deltaX < 0 && absDeltaX > absDeltaY && absDeltaX > 5) {
       shouldSwipe = true;
-    } else if (side === "bottom" && deltaY > 0 && absDeltaY > absDeltaX) {
+    } else if (side === "bottom" && deltaY > 0 && absDeltaY > absDeltaX && absDeltaY > 5) {
       shouldSwipe = true;
-    } else if (side === "top" && deltaY < 0 && absDeltaY > absDeltaX) {
+    } else if (side === "top" && deltaY < 0 && absDeltaY > absDeltaX && absDeltaY > 5) {
       shouldSwipe = true;
     }
 
     if (shouldSwipe) {
+      // Prevent scrolling when swiping to close
+      e.preventDefault();
+      e.stopPropagation();
       // Apply visual feedback during swipe - only allow movement in close direction
       const translateX = side === "right" ? Math.max(0, deltaX) : side === "left" ? Math.min(0, deltaX) : 0;
       const translateY = side === "bottom" ? Math.max(0, deltaY) : side === "top" ? Math.min(0, deltaY) : 0;
@@ -115,64 +127,78 @@ const SheetContent = React.forwardRef<
     }
 
     const touch = e.changedTouches[0];
+    if (!touch) {
+      touchStartRef.current = null;
+      return;
+    }
+    
     const deltaX = touch.clientX - touchStartRef.current.x;
     const deltaY = touch.clientY - touchStartRef.current.y;
     const absDeltaX = Math.abs(deltaX);
     const absDeltaY = Math.abs(deltaY);
     const duration = Date.now() - touchStartTimeRef.current;
+    // Fix velocity calculation to handle edge cases
     const velocity = duration > 0 ? Math.sqrt(deltaX * deltaX + deltaY * deltaY) / duration : 0;
 
     // Determine if swipe should close the sheet
+    // More lenient thresholds for easier dismissal
     let shouldClose = false;
-    const threshold = 80; // Minimum distance (lowered for easier triggering)
-    const velocityThreshold = 0.25; // Minimum velocity (px/ms) - lowered for easier triggering
-    const minDistance = 30; // Minimum movement to consider it a swipe
+    const distanceThreshold = 30; // Minimum distance (reduced further)
+    const velocityThreshold = 0.1; // Minimum velocity (px/ms) (reduced further)
+    const percentageThreshold = 0.15; // Close if swiped 15% of panel width/height (reduced)
 
-    // Check if we have enough movement in the right direction
-    if (absDeltaX < minDistance && absDeltaY < minDistance) {
-      // Not enough movement - reset and return
-      contentRef.current.style.transform = "";
-      contentRef.current.style.transition = "";
+    // Get panel dimensions for percentage-based threshold
+    const panelWidth = contentRef.current.offsetWidth;
+    const panelHeight = contentRef.current.offsetHeight;
+    const widthThreshold = panelWidth * percentageThreshold;
+    const heightThreshold = panelHeight * percentageThreshold;
+
+    if (side === "right" && deltaX > 0 && absDeltaX > absDeltaY) {
+      shouldClose = deltaX > distanceThreshold || deltaX > widthThreshold || (velocity > velocityThreshold && deltaX > 15);
+    } else if (side === "left" && deltaX < 0 && absDeltaX > absDeltaY) {
+      shouldClose = deltaX < -distanceThreshold || deltaX < -widthThreshold || (velocity > velocityThreshold && deltaX < -15);
+    } else if (side === "bottom" && deltaY > 0 && absDeltaY > absDeltaX) {
+      shouldClose = deltaY > distanceThreshold || deltaY > heightThreshold || (velocity > velocityThreshold && deltaY > 15);
+    } else if (side === "top" && deltaY < 0 && absDeltaY > absDeltaX) {
+      shouldClose = deltaY < -distanceThreshold || deltaY < -heightThreshold || (velocity > velocityThreshold && deltaY < -15);
+    }
+
+    if (shouldClose) {
+      // Close the sheet immediately - let Radix UI handle the animation
+      // Don't reset transform here as it might interfere with Radix's animation
+      if (onOpenChangeProp) {
+        onOpenChangeProp(false);
+      } else if (closeButtonRef.current) {
+        // Fallback: trigger close button click which will close via Radix UI
+        closeButtonRef.current.click();
+      }
+      // Reset transform after a brief delay to let Radix start its animation
+      setTimeout(() => {
+        if (contentRef.current) {
+          contentRef.current.style.transform = "";
+          contentRef.current.style.transition = "";
+        }
+      }, 50);
       touchStartRef.current = null;
       return;
     }
 
-    if (side === "right" && deltaX > threshold && absDeltaX > absDeltaY) {
-      shouldClose = true;
-    } else if (side === "right" && velocity > velocityThreshold && deltaX > 0 && absDeltaX > absDeltaY && absDeltaX > minDistance) {
-      shouldClose = true;
-    } else if (side === "left" && deltaX < -threshold && absDeltaX > absDeltaY) {
-      shouldClose = true;
-    } else if (side === "left" && velocity > velocityThreshold && deltaX < 0 && absDeltaX > absDeltaY && absDeltaX > minDistance) {
-      shouldClose = true;
-    } else if (side === "bottom" && deltaY > threshold && absDeltaY > absDeltaX) {
-      shouldClose = true;
-    } else if (side === "bottom" && velocity > velocityThreshold && deltaY > 0 && absDeltaY > absDeltaX && absDeltaY > minDistance) {
-      shouldClose = true;
-    } else if (side === "top" && deltaY < -threshold && absDeltaY > absDeltaX) {
-      shouldClose = true;
-    } else if (side === "top" && velocity > velocityThreshold && deltaY < 0 && absDeltaY > absDeltaX && absDeltaY > minDistance) {
-      shouldClose = true;
-    }
-
-    if (shouldClose && onOpenChange) {
-      // Close the sheet - Radix UI will handle the animation
-      // Don't reset transform - let Radix UI's close animation take over
-      onOpenChange(false);
-    } else {
-      // Animate back smoothly if not closing
-      contentRef.current.style.transition = "transform 0.2s ease-out";
-      contentRef.current.style.transform = "";
-      // Reset transition after animation completes
-      setTimeout(() => {
-        if (contentRef.current) {
-          contentRef.current.style.transition = "";
-        }
-      }, 200);
-    }
+    // If not closing, spring back smoothly
+    contentRef.current.style.transition = "transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)";
+    requestAnimationFrame(() => {
+      if (contentRef.current) {
+        contentRef.current.style.transform = "";
+        // Clear inline transition after animation completes
+        setTimeout(() => {
+          if (contentRef.current) {
+            contentRef.current.style.transition = "";
+          }
+        }, 300);
+      }
+    });
 
     touchStartRef.current = null;
-  }, [side, onOpenChange]);
+  }, [side, onOpenChangeProp]);
 
   // Combine refs
   React.useImperativeHandle(ref, () => contentRef.current as any, []);
@@ -184,13 +210,15 @@ const SheetContent = React.forwardRef<
         ref={contentRef}
         className={cn(sheetVariants({ side }), className)}
         data-slot="sheet-content"
+        style={{ touchAction: side === "right" || side === "left" ? "pan-y" : "pan-x" }}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchEnd}
         {...props}
       >
         {/* Close button - always visible, positioned with safe area padding */}
-        <SheetPrimitive.Close className={closeButtonClasses}>
+        <SheetPrimitive.Close ref={closeButtonRef} className={closeButtonClasses}>
           <X className="h-4 w-4" />
           <span className="sr-only">Close</span>
         </SheetPrimitive.Close>
