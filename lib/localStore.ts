@@ -19,6 +19,7 @@ export interface PendingLocation {
   wait_time: number;
   trip_ids?: string[];
   created_at: string;
+  uploaded?: boolean;
 }
 
 export interface PendingPhoto {
@@ -95,6 +96,7 @@ export async function addPendingLocation(
     id,
     created_at,
     ...loc,
+    uploaded: loc.uploaded ?? false,
   };
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_LOCATIONS, "readwrite");
@@ -115,7 +117,7 @@ export async function addPendingLocation(
 
 export async function updatePendingLocation(
   id: string,
-  updates: Partial<Pick<PendingLocation, "latitude" | "longitude" | "timestamp" | "wait_time" | "trip_ids">>
+  updates: Partial<Pick<PendingLocation, "latitude" | "longitude" | "timestamp" | "wait_time" | "trip_ids" | "uploaded">>
 ): Promise<void> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -176,6 +178,47 @@ export async function getPendingLocationsForUser(userId: string): Promise<Pendin
       db.close();
       console.warn("[Location:localStore] getPendingLocationsForUser error; treating as empty list", tx.error ?? "Unknown IndexedDB error");
       resolve([]);
+    };
+  });
+}
+
+/**
+ * Replace all pending locations for a user (e.g. when Swift is source of truth and has newer data).
+ */
+export async function setPendingLocationsForUser(userId: string, locations: PendingLocation[]): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_LOCATIONS, "readwrite");
+    const store = tx.objectStore(STORE_LOCATIONS);
+    const getAllReq = store.getAll();
+    getAllReq.onsuccess = () => {
+      const all = (getAllReq.result || []) as PendingLocation[];
+      for (const loc of all) {
+        if (loc.user_id === userId) store.delete(loc.id);
+      }
+      for (const loc of locations) {
+        if (loc.user_id !== userId) continue;
+        const record: PendingLocation = {
+          id: loc.id,
+          user_id: loc.user_id,
+          latitude: loc.latitude,
+          longitude: loc.longitude,
+          timestamp: loc.timestamp,
+          wait_time: loc.wait_time ?? 0,
+          created_at: loc.created_at ?? new Date().toISOString(),
+          uploaded: loc.uploaded ?? false,
+        };
+        if (loc.trip_ids != null) record.trip_ids = loc.trip_ids;
+        store.put(record);
+      }
+    };
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
     };
   });
 }

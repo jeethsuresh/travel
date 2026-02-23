@@ -15,6 +15,7 @@ import { uploadLocationToFirestore, updateLocationInFirestore } from "@/lib/fire
 import { getFirebaseFirestore } from "@/lib/firebase";
 import { Geolocation } from "@capacitor/geolocation";
 import { App } from "@capacitor/app";
+import { Preferences } from "@capacitor/preferences";
 import { isNativePlatform } from "@/lib/capacitor";
 
 // Fix for default marker icons in Next.js - only run on client
@@ -267,6 +268,35 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
     });
   }, []);
 
+  // Retry Firestore upload when db is initially null (e.g. Firebase still initializing).
+  // Runs the upload when db becomes available, then calls onSync so the background runner can upload if we still fail.
+  const firestoreUploadWithRetry = useCallback(
+    async (
+      doUpload: (db: NonNullable<ReturnType<typeof getFirebaseFirestore>>) => Promise<void>,
+      onSync: () => void
+    ) => {
+      const maxAttempts = 3;
+      const delays = [0, 500, 1500];
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, delays[attempt]));
+        const db = getFirebaseFirestore();
+        if (db) {
+          try {
+            await doUpload(db);
+            return;
+          } catch (error) {
+            console.error("[Location:update] Firestore upload failed (will sync to runner)", error);
+            onSync();
+            return;
+          }
+        }
+      }
+      console.warn("[Location:update] Firestore not available after retries; pending synced to Preferences for background runner");
+      onSync();
+    },
+    []
+  );
+
   const saveLocation = useCallback(async (lat: number, lng: number) => {
     if (!user) return;
 
@@ -306,19 +336,18 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
               trip_ids: tripIds.length > 0 ? tripIds : undefined,
             });
             
-            // Upload update to Firebase immediately (non-blocking)
-            const db = getFirebaseFirestore();
-            if (db) {
-              updateLocationInFirestore(db, lastLocationRef.current.id, {
-                latitude: lat,
-                longitude: lng,
-                timestamp: nowISO,
-                wait_time: newWaitTime,
-                trip_ids: tripIds.length > 0 ? tripIds : undefined,
-              }).catch((error) => {
-                console.error("[Location:update] Background upload failed (non-critical)", error);
-              });
-            }
+            // Upload update to Firestore (retry if db null); sync to Preferences so runner can upload if we skip/fail
+            await firestoreUploadWithRetry(
+              (db) =>
+                updateLocationInFirestore(db, lastLocationRef.current!.id, {
+                  latitude: lat,
+                  longitude: lng,
+                  timestamp: nowISO,
+                  wait_time: newWaitTime,
+                  trip_ids: tripIds.length > 0 ? tripIds : undefined,
+                }),
+              () => onPendingLocationsChange?.()
+            );
             
             lastLocationRef.current = {
               ...lastLocationRef.current,
@@ -353,13 +382,11 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
         trip_ids: tripIds.length > 0 ? tripIds : undefined,
       });
       
-      // Upload to Firebase immediately (non-blocking)
-      const db = getFirebaseFirestore();
-      if (db) {
-        uploadLocationToFirestore(db, pending).catch((error) => {
-          console.error("[Location:update] Background upload failed (non-critical)", error);
-        });
-      }
+      // Upload to Firestore (retry if db null); sync to Preferences so runner can upload if we skip/fail
+      await firestoreUploadWithRetry(
+        (db) => uploadLocationToFirestore(db, pending),
+        () => onPendingLocationsChange?.()
+      );
       
       lastLocationRef.current = {
         lat: pending.latitude,
@@ -375,7 +402,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
     } catch (error) {
       console.error("Error saving location:", error);
     }
-  }, [user, onLocationUpdate, onPendingLocationsChange, onLocationSaved]);
+  }, [user, onLocationUpdate, onPendingLocationsChange, onLocationSaved, firestoreUploadWithRetry]);
 
   const startTracking = useCallback(async () => {
     if (!user) {
@@ -464,11 +491,10 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
           watchOptions,
           (position, err) => {
             if (err) {
-              console.error("[Location:bg] Error watching location (native):", err);
               // Don't stop tracking for transient errors - only for permission denied
               const errorCode = (err as any)?.code;
+              const errorMessage = (err as any)?.errorMessage ?? (err as any)?.message;
               if (errorCode === 1 || errorCode === 'PERMISSION_DENIED') {
-                // Permission denied - stop tracking
                 console.error("[Location:bg] Permission denied, stopping tracking");
                 setError("Location permission was denied. Please enable location access.");
                 setIsTracking(false);
@@ -476,10 +502,15 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
                 clearWatchRef();
                 return;
               }
-              // For other errors (timeout, unavailable), log but keep trying
-              console.warn("[Location:bg] Transient error, will retry:", err);
+              // OS-PLUG-GLOC-0002 / locationUnavailable is expected when app is backgrounded;
+              // native plugin keeps watch callbacks alive and will deliver again when a fix is available.
+              if (errorCode === 'OS-PLUG-GLOC-0002' || errorMessage?.includes('backgrounding')) {
+                console.warn("[Location:bg] Location temporarily unavailable (e.g. in background); watch remains active.");
+              } else {
+                console.error("[Location:bg] Error watching location (native):", err);
+                console.warn("[Location:bg] Transient error, will retry:", err);
+              }
               setError(null); // Clear error for transient issues
-              // Don't stop tracking - let it retry automatically
               return;
             }
             if (position?.coords) {
@@ -653,6 +684,13 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
       listenerPromise.then((l) => l.remove()).catch(() => {});
     };
   }, [isTracking, isRequesting, user, startTracking]);
+
+  // Persist tracking state to Capacitor Preferences so Swift can respect it in background.
+  useEffect(() => {
+    if (!isNativePlatform() || !user) return;
+    const value = isTracking ? "true" : "false";
+    Preferences.set({ key: "jeethtravel.trackingEnabled", value }).catch(() => {});
+  }, [isTracking, user]);
 
   // Cleanup on unmount
   useEffect(() => {

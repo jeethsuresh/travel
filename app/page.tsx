@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/sheet";
 import type { User } from "@/lib/types";
 import { getFirebaseAuth, getFirebaseFirestore } from "@/lib/firebase";
-import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocation } from "@/lib/localStore";
+import { getPendingLocationsForUser, getPendingPhotosForUser, deletePendingLocation, setPendingLocationsForUser, type PendingLocation as LocalPendingLocation } from "@/lib/localStore";
 import { subscribeUserSettings } from "@/lib/userSettings";
 import { subscribeSharedLocationsForUser } from "@/lib/sharedLocations";
 import { updateMySharedLocation } from "@/lib/sharedLocations";
@@ -337,24 +337,64 @@ export default function Home() {
     }
   }, [user, fetchLocations, fetchPhotos]);
 
-  // Sync pending locations + Firebase auth to Preferences so background runner can upload to Firestore
+  // Sync pending locations + Firebase auth to Preferences so Swift background task (and JS when active) can use the same path
   const syncPendingToPreferencesForRunner = useCallback(async () => {
     if (!isNativePlatform() || !user) return;
     const auth = getFirebaseAuth();
     if (!auth?.currentUser) return;
     try {
       const pending = await getPendingLocationsForUser(user.id);
-      if (pending.length === 0) return;
       const token = await auth.currentUser.getIdToken(true);
       const projectId = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
       if (!projectId) return;
-      await Preferences.set({
-        key: "jeethtravel.pending",
-        value: JSON.stringify(pending),
-      });
+      // Firebase Web SDK does not expose refreshToken on User; internal persistence uses it. Access for Swift background refresh.
+      const refreshToken =
+        (auth.currentUser as unknown as { stsTokenManager?: { refreshToken?: string } })?.stsTokenManager?.refreshToken ?? undefined;
+      const apiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY ?? null;
       await Preferences.set({
         key: "jeethtravel.firebaseAuth",
-        value: JSON.stringify({ projectId, idToken: token }),
+        value: JSON.stringify({ projectId, idToken: token, refreshToken: refreshToken ?? null, apiKey }),
+      });
+
+      const prefsPendingRaw = await Preferences.get({ key: "jeethtravel.pending" });
+      const prefsPending: LocalPendingLocation[] = prefsPendingRaw.value
+        ? (() => {
+            try {
+              return JSON.parse(prefsPendingRaw.value) as LocalPendingLocation[];
+            } catch {
+              return [];
+            }
+          })()
+        : [];
+
+      const mergedById = new globalThis.Map<string, LocalPendingLocation>();
+      for (const loc of prefsPending) {
+        mergedById.set(loc.id, {
+          ...loc,
+          uploaded: loc.uploaded ?? false,
+          user_id: loc.user_id || user.id,
+        });
+      }
+      for (const loc of pending) {
+        const existing = mergedById.get(loc.id);
+        mergedById.set(loc.id, {
+          ...(existing ?? loc),
+          id: loc.id,
+          user_id: loc.user_id,
+          latitude: loc.latitude,
+          longitude: loc.longitude,
+          timestamp: loc.timestamp,
+          wait_time: loc.wait_time ?? existing?.wait_time ?? 0,
+          trip_ids: loc.trip_ids ?? existing?.trip_ids,
+          created_at: loc.created_at ?? existing?.created_at ?? new Date().toISOString(),
+          uploaded: existing?.uploaded ?? false,
+        });
+      }
+
+      const merged = Array.from(mergedById.values());
+      await Preferences.set({
+        key: "jeethtravel.pending",
+        value: JSON.stringify(merged),
       });
     } catch (e) {
       console.warn("[Location:Preferences] sync for runner failed", e);
@@ -438,16 +478,32 @@ export default function Home() {
     });
   }, [user?.id, userDisplayName, locations.length, locations[0]?.timestamp]);
 
-  // On app active: apply uploadedIds from runner (remove from IndexedDB and refetch)
+  // On app active: prefer Swift when newer (Preferences vs IndexedDB); optionally apply legacy uploadedIds
   useEffect(() => {
-    if (!isNativePlatform()) {
+    if (!isNativePlatform() || !user?.id) {
       return;
     }
     
     const listenerPromise = App.addListener("appStateChange", async (state) => {
       if (state.isActive) {
         try {
-          // Handle location uploads from background runner
+          const prefsPendingRaw = await Preferences.get({ key: "jeethtravel.pending" });
+          const indexedDbPending = await getPendingLocationsForUser(user.id);
+          const prefsPending: Array<{ id: string; user_id: string; latitude: number; longitude: number; timestamp: string; wait_time?: number; trip_ids?: string[]; created_at?: string }> = prefsPendingRaw.value
+            ? (() => {
+                try {
+                  return JSON.parse(prefsPendingRaw.value);
+                } catch {
+                  return [];
+                }
+              })()
+            : [];
+          const prefsLatest = prefsPending.length > 0 ? prefsPending.reduce((a, b) => (new Date(a.timestamp).getTime() >= new Date(b.timestamp).getTime() ? a : b)) : null;
+          const idbLatest = indexedDbPending.length > 0 ? indexedDbPending.reduce((a, b) => (new Date(a.timestamp).getTime() >= new Date(b.timestamp).getTime() ? a : b)) : null;
+          if (prefsLatest && (!idbLatest || new Date(prefsLatest.timestamp).getTime() > new Date(idbLatest.timestamp).getTime())) {
+            await setPendingLocationsForUser(user.id, prefsPending.map((p) => ({ ...p, user_id: user.id, wait_time: p.wait_time ?? 0, created_at: p.created_at ?? new Date().toISOString() })));
+            fetchLocations();
+          }
           const { value } = await Preferences.get({ key: "jeethtravel.uploadedIds" });
           if (value) {
             const ids = JSON.parse(value) as string[];
@@ -456,7 +512,7 @@ export default function Home() {
             fetchLocations();
           }
         } catch (e) {
-          console.warn("[Location:uploadedIds] apply failed", e);
+          console.warn("[Location:onActive] apply failed", e);
         }
       } else {
         syncPendingToPreferencesForRunner();
@@ -465,7 +521,7 @@ export default function Home() {
     return () => {
       listenerPromise.then((l) => l.remove()).catch(() => {});
     };
-  }, [syncPendingToPreferencesForRunner, fetchLocations]);
+  }, [user?.id, syncPendingToPreferencesForRunner, fetchLocations]);
 
   useEffect(() => {
     return () => {

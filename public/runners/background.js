@@ -4,7 +4,7 @@
  * Responsibilities:
  * - Read pending locations + auth from CapacitorKV (same store as @capacitor/preferences).
  * - Upload all pending locations whenever the runner executes (scheduled every 1 minute).
- * - Send all pending locations in a single batched insert to Firestore.
+ * - Use Firestore REST PATCH per document so new documents are created and existing ones updated (upsert).
  *
  * Main app writes `jeethtravel.pending` and `jeethtravel.firebaseAuth` via Preferences; we read and upload.
  */
@@ -13,7 +13,6 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
     console.log("[Background:upload] Background runner started");
     var pendingKey = "CapacitorStorage.jeethtravel.pending";
     var authKey = "CapacitorStorage.jeethtravel.firebaseAuth";
-    var uploadedIdsKey = "CapacitorStorage.jeethtravel.uploadedIds";
 
     var pendingRaw = CapacitorKV.get(pendingKey);
     var authRaw = CapacitorKV.get(authKey);
@@ -46,22 +45,28 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
       return;
     }
 
-    // Upload whenever there are pending locations (no throttle)
-    // The background runner is scheduled to run every 1 minute, so this will upload
-    // locations as they are received in the background.
-    console.log("[Background:upload] Proceeding with upload of " + pending.length + " locations");
+    // Only upload locations that have not been successfully uploaded yet.
+    var toUpload = pending.filter(function (loc) {
+      return !loc.uploaded;
+    });
 
-    var uploadedIds = [];
-    var writes = [];
+    if (toUpload.length === 0) {
+      console.log("[Background:upload] No un-uploaded locations to process, exiting");
+      resolve();
+      return;
+    }
+
+    console.log("[Background:upload] Proceeding with upload of " + toUpload.length + " un-uploaded locations (PATCH upsert)");
+
+    var items = [];
     var headers = {
       Authorization: "Bearer " + auth.idToken,
       "Content-Type": "application/json",
     };
 
-    for (var i = 0; i < pending.length; i++) {
-      var loc = pending[i];
+    for (var i = 0; i < toUpload.length; i++) {
+      var loc = toUpload[i];
       
-      // Validate timestamp before processing
       if (!loc.timestamp || typeof loc.timestamp !== "string") {
         console.warn("[Background:upload] Skipping location with invalid timestamp:", loc.id);
         continue;
@@ -79,10 +84,7 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
       var elapsedSinceUpdate = Math.max(0, Math.floor((nowMs - timestampMs) / 1000));
       var effectiveWaitTime = storedWait + elapsedSinceUpdate;
 
-      // Convert timestamp to Firestore timestamp format
       var timestampStr = timestampDate.toISOString();
-      
-      var docId = loc.id;
       var fields = {
         user_id: { stringValue: loc.user_id },
         latitude: { doubleValue: loc.latitude },
@@ -95,87 +97,65 @@ addEventListener("uploadPendingLocations", async function (resolve, reject) {
           return { stringValue: tripId };
         }) } };
       }
-      
-      // Use 'set' operation which creates or updates the document
-      // This works whether the document exists or not (unlike 'update' which requires existence)
-      writes.push({
-        update: {
-          name: "projects/" + auth.projectId + "/databases/(default)/documents/locations/" + loc.id,
-          fields: fields
-        }
-        // Note: Firestore REST API batchWrite 'update' operations require documents to exist.
-        // However, if immediate uploads succeeded, documents will exist and this will work.
-        // If immediate uploads failed, we'll get errors but immediate upload will retry.
-      });
-      uploadedIds.push(loc.id);
+      items.push({ id: loc.id, fields: fields });
     }
 
-    // Skip if no valid writes to perform
-    if (writes.length === 0) {
+    if (items.length === 0) {
       console.warn("[Background:upload] No valid locations to upload after validation");
       resolve();
       return;
     }
 
-    // Use Firestore batch write API
-    // Note: Using 'update' in batchWrite - this will fail if documents don't exist
-    // If immediate uploads succeeded, documents exist and this will work
-    // If immediate uploads failed, we'll get errors but that's okay - immediate upload will retry
-    var batchUrl = "https://firestore.googleapis.com/v1/projects/" + auth.projectId + "/databases/(default)/documents:batchWrite";
-    var body = {
-      writes: writes
-    };
+    // PATCH each document (upsert: creates if not exists, updates if exists). Run in small parallel batches.
+    var baseUrl = "https://firestore.googleapis.com/v1/projects/" + auth.projectId + "/databases/(default)/documents/locations/";
+    var updateMaskPaths = ["user_id", "latitude", "longitude", "timestamp", "wait_time"];
+    var batchSize = 8;
+    var hasErrors = false;
 
-    console.log("[Background:upload] Sending batch write request for " + writes.length + " locations");
-    var res = await fetch(batchUrl, {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(body),
-    });
-
-    if (!res) {
-      console.error("[Background:upload] No response from Firestore API");
-      resolve(); // Don't reject - let it retry on next run
-      return;
-    }
-
-    var responseText = await res.text();
-    var responseData;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch (e) {
-      console.error("[Background:upload] Failed to parse response:", responseText);
-      resolve(); // Don't reject - let it retry on next run
-      return;
-    }
-
-    if (res.status >= 200 && res.status < 300) {
-      // Check if there were any write errors in the response
-      var hasErrors = false;
-      if (responseData.writeResults && responseData.writeResults.length > 0) {
-        for (var j = 0; j < responseData.writeResults.length; j++) {
-          if (responseData.writeResults[j].status && responseData.writeResults[j].status.code !== 0) {
-            console.error("[Background:upload] Write error for location:", uploadedIds[j], responseData.writeResults[j].status);
-            hasErrors = true;
+    for (var b = 0; b < items.length; b += batchSize) {
+      var batch = items.slice(b, b + batchSize);
+      var promises = batch.map(function (item) {
+        var docPath = baseUrl + encodeURIComponent(item.id);
+        var fieldPaths = updateMaskPaths.slice();
+        if (item.fields.trip_ids) fieldPaths.push("trip_ids");
+        var query = fieldPaths.map(function (p) { return "updateMask.fieldPaths=" + encodeURIComponent(p); }).join("&");
+        var url = docPath + "?" + query;
+        return fetch(url, {
+          method: "PATCH",
+          headers: headers,
+          body: JSON.stringify({ fields: item.fields }),
+        }).then(function (res) {
+          if (res.status < 200 || res.status >= 300) {
+            return res.text().then(function (text) {
+              console.error("[Background:upload] PATCH failed for location:", item.id, res.status, text);
+              hasErrors = true;
+            });
+          } else {
+            // Mark this location as uploaded in the pending array.
+            for (var idx = 0; idx < pending.length; idx++) {
+              if (pending[idx].id === item.id) {
+                pending[idx].uploaded = true;
+                break;
+              }
+            }
           }
-        }
-      }
-      
-      if (!hasErrors && uploadedIds.length > 0) {
-        CapacitorKV.set(uploadedIdsKey, JSON.stringify(uploadedIds));
-        CapacitorKV.remove(pendingKey);
-        console.log("[Background:upload] Successfully uploaded " + uploadedIds.length + " locations");
-      } else if (hasErrors) {
-        console.warn("[Background:upload] Some writes failed - keeping pending locations for retry");
-        // Don't clear pending - let immediate upload handle retries
-      }
-      resolve();
-    } else {
-      console.error("[Background:upload] Firestore API error:", res.status, responseData);
-      // Don't reject - let it retry on next run
-      // The immediate upload in the main app will handle retries
-      resolve();
+        });
+      });
+      await Promise.all(promises);
     }
+
+    if (hasErrors) {
+      console.warn("[Background:upload] Some PATCHes failed - keeping pending locations for retry");
+    }
+
+    // Persist updated pending locations with uploaded flags so future runs can skip already-uploaded entries.
+    try {
+      CapacitorKV.set(pendingKey, JSON.stringify(pending));
+      console.log("[Background:upload] Persisted pending locations with updated uploaded flags");
+    } catch (e) {
+      console.warn("[Background:upload] Failed to persist updated pending locations", e);
+    }
+    resolve();
   } catch (err) {
     console.error("[Background] Error in uploadPendingLocations:", err);
     reject(err);
