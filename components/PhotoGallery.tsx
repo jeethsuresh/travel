@@ -12,7 +12,7 @@ import {
   getPendingPhotosForUser,
   deletePendingPhoto,
 } from "@/lib/localStore";
-import { getTrips, getTripsForTimestamp } from "@/lib/firebase/trips";
+import { getTrips, getTripsForTimestamp, type Trip } from "@/lib/firebase/trips";
 
 interface Photo {
   id: string;

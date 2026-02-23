@@ -10,8 +10,11 @@ import {
   updatePendingLocation,
   getPendingLocationsForUser,
 } from "@/lib/localStore";
-import { getActiveTrips } from "@/lib/firebase/trips";
+import { getActiveTrips, type Trip } from "@/lib/firebase/trips";
+import { uploadLocationToFirestore, updateLocationInFirestore } from "@/lib/firebase/locations";
+import { getFirebaseFirestore } from "@/lib/firebase";
 import { Geolocation } from "@capacitor/geolocation";
+import { App } from "@capacitor/app";
 import { isNativePlatform } from "@/lib/capacitor";
 
 // Fix for default marker icons in Next.js - only run on client
@@ -95,6 +98,7 @@ interface Location {
   lng: number;
   timestamp: string;
   wait_time?: number;
+  trip_ids?: string[];
 }
 
 interface Photo {
@@ -121,6 +125,8 @@ interface MapProps {
   photos?: Photo[];
   /** Friend locations to show (when they share with you) */
   friendLocations?: FriendLocation[];
+  /** Active trips for filtering and coloring locations */
+  trips?: Trip[];
   onLocationUpdate: () => void;
   focusLocation?: { latitude: number; longitude: number } | null;
   /** Called when pending locations change so the page can sync to Preferences for the background runner */
@@ -249,8 +255,10 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
     isLocal?: boolean;
     wait_time?: number;
   } | null>(null);
-  const lastSaveTimeRef = useRef<number | null>(null);
-  const TRACKING_INTERVAL_MS = 5 * 60 * 1000; // Save location at most once every 5 minutes
+  // Track if we should be tracking (for auto-restart on errors/app state changes)
+  const shouldBeTrackingRef = useRef(false);
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // Removed TRACKING_INTERVAL_MS - locations are now saved immediately when received
 
   // Check permission status on mount
   useEffect(() => {
@@ -281,7 +289,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
           const lastTimestamp = new Date(lastLocationRef.current.timestamp);
           const timeDiff = Math.floor((now.getTime() - lastTimestamp.getTime()) / 1000); // seconds
 
-          // Last location is in IndexedDB (pending): update wait_time locally for next sync/Background App Refresh
+          // Last location is in IndexedDB (pending): update wait_time locally and upload immediately
           if (lastLocationRef.current.isLocal) {
             const newWaitTime = (lastLocationRef.current.wait_time ?? 0) + timeDiff;
             console.log("[Location:update] updating pending wait_time", { id: lastLocationRef.current.id, timeDiff, newWaitTime });
@@ -297,6 +305,21 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
               longitude: lng,
               trip_ids: tripIds.length > 0 ? tripIds : undefined,
             });
+            
+            // Upload update to Firebase immediately (non-blocking)
+            const db = getFirebaseFirestore();
+            if (db) {
+              updateLocationInFirestore(db, lastLocationRef.current.id, {
+                latitude: lat,
+                longitude: lng,
+                timestamp: nowISO,
+                wait_time: newWaitTime,
+                trip_ids: tripIds.length > 0 ? tripIds : undefined,
+              }).catch((error) => {
+                console.error("[Location:update] Background upload failed (non-critical)", error);
+              });
+            }
+            
             lastLocationRef.current = {
               ...lastLocationRef.current,
               lat,
@@ -314,7 +337,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
         }
       }
 
-      // New location: store in IndexedDB first (sync and Background App Refresh will upload later)
+      // New location: store in IndexedDB first, then upload immediately
       console.log("[Location:update] adding new pending location", { lat, lng });
       
       // Get active trips to tag this location
@@ -329,6 +352,15 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
         wait_time: 0,
         trip_ids: tripIds.length > 0 ? tripIds : undefined,
       });
+      
+      // Upload to Firebase immediately (non-blocking)
+      const db = getFirebaseFirestore();
+      if (db) {
+        uploadLocationToFirestore(db, pending).catch((error) => {
+          console.error("[Location:update] Background upload failed (non-critical)", error);
+        });
+      }
+      
       lastLocationRef.current = {
         lat: pending.latitude,
         lng: pending.longitude,
@@ -396,14 +428,8 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
 
     const onPosition = (latitude: number, longitude: number) => {
       setCurrentLocation({ lat: latitude, lng: longitude });
-      const now = Date.now();
-      const shouldSave =
-        lastSaveTimeRef.current === null ||
-        now - lastSaveTimeRef.current >= TRACKING_INTERVAL_MS;
-      if (shouldSave) {
-        lastSaveTimeRef.current = now;
-        saveLocation(latitude, longitude);
-      }
+      // Save location immediately (no interval check)
+      saveLocation(latitude, longitude);
     };
 
     const clearWatchRef = () => {
@@ -424,7 +450,6 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
         const pos = await Geolocation.getCurrentPosition(geoOptions);
         const { latitude, longitude } = pos.coords;
         setCurrentLocation({ lat: latitude, lng: longitude });
-        lastSaveTimeRef.current = Date.now();
         saveLocation(latitude, longitude);
         setIsTracking(true);
         setIsRequesting(false);
@@ -439,13 +464,27 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
           watchOptions,
           (position, err) => {
             if (err) {
-              console.error("Error watching location (native):", err);
-              setError("Error tracking location. Please check permissions.");
-              setIsTracking(false);
-              clearWatchRef();
+              console.error("[Location:bg] Error watching location (native):", err);
+              // Don't stop tracking for transient errors - only for permission denied
+              const errorCode = (err as any)?.code;
+              if (errorCode === 1 || errorCode === 'PERMISSION_DENIED') {
+                // Permission denied - stop tracking
+                console.error("[Location:bg] Permission denied, stopping tracking");
+                setError("Location permission was denied. Please enable location access.");
+                setIsTracking(false);
+                shouldBeTrackingRef.current = false;
+                clearWatchRef();
+                return;
+              }
+              // For other errors (timeout, unavailable), log but keep trying
+              console.warn("[Location:bg] Transient error, will retry:", err);
+              setError(null); // Clear error for transient issues
+              // Don't stop tracking - let it retry automatically
               return;
             }
             if (position?.coords) {
+              // Clear any previous errors on successful update
+              setError(null);
               console.log("[Location:bg] native watchPosition update", {
                 lat: position.coords.latitude,
                 lng: position.coords.longitude,
@@ -455,6 +494,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
           }
         );
         watchIdRef.current = callbackId;
+        shouldBeTrackingRef.current = true;
       } catch (err) {
         setIsRequesting(false);
         setIsTracking(false);
@@ -469,7 +509,6 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
       (position) => {
         const { latitude, longitude } = position.coords;
         setCurrentLocation({ lat: latitude, lng: longitude });
-        lastSaveTimeRef.current = Date.now();
         saveLocation(latitude, longitude);
         setIsTracking(true);
         setIsRequesting(false);
@@ -484,32 +523,31 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
         watchIdRef.current = navigator.geolocation.watchPosition(
           (pos) => {
             const { latitude, longitude } = pos.coords;
+            // Clear any previous errors on successful update
+            setError(null);
             console.log("[Location:bg] web watchPosition update", { lat: latitude, lng: longitude });
             onPosition(latitude, longitude);
           },
           (error) => {
-            console.error("Error watching location:", error);
-            let errorMessage = "Error tracking location. ";
-            switch (error.code) {
-              case error.PERMISSION_DENIED:
-                errorMessage += "Location permission was denied.";
-                setPermissionStatus("denied");
-                break;
-              case error.POSITION_UNAVAILABLE:
-                errorMessage += "Location information is unavailable.";
-                break;
-              case error.TIMEOUT:
-                errorMessage += "Location request timed out.";
-                break;
-              default:
-                errorMessage += "Please check your permissions.";
+            console.error("[Location:bg] Error watching location:", error);
+            // Only stop tracking for permission denied - other errors are transient
+            if (error.code === error.PERMISSION_DENIED) {
+              console.error("[Location:bg] Permission denied, stopping tracking");
+              setError("Location permission was denied. Please enable location access.");
+              setPermissionStatus("denied");
+              setIsTracking(false);
+              shouldBeTrackingRef.current = false;
+              clearWatchRef();
+            } else {
+              // For transient errors (timeout, unavailable), log but keep trying
+              console.warn("[Location:bg] Transient error, will continue:", error.code);
+              setError(null); // Clear error for transient issues
+              // Don't stop tracking - let it retry automatically
             }
-            setError(errorMessage);
-            setIsTracking(false);
-            clearWatchRef();
           },
           watchOptions
         );
+        shouldBeTrackingRef.current = true;
       },
       (error) => {
         setIsRequesting(false);
@@ -544,6 +582,12 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
   const stopTracking = useCallback(() => {
     setIsTracking(false);
     setError(null);
+    shouldBeTrackingRef.current = false;
+    // Clear any retry timeouts
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
     if (watchIdRef.current !== null) {
       if (typeof watchIdRef.current === "string") {
         Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
@@ -553,8 +597,62 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
       watchIdRef.current = null;
     }
     lastLocationRef.current = null;
-    lastSaveTimeRef.current = null;
   }, []);
+
+  // Auto-restart tracking if it stops unexpectedly (e.g., due to transient errors)
+  useEffect(() => {
+    if (!isNativePlatform() || !user) return;
+    
+    const checkAndRestart = async () => {
+      // Only restart if we should be tracking but aren't
+      if (shouldBeTrackingRef.current && !isTracking && !isRequesting) {
+        console.log("[Location:bg] Tracking stopped unexpectedly, attempting to restart...");
+        // Wait a bit before restarting to avoid rapid retries
+        retryTimeoutRef.current = setTimeout(() => {
+          if (shouldBeTrackingRef.current && !isTracking) {
+            console.log("[Location:bg] Restarting tracking...");
+            startTracking().catch((err) => {
+              console.error("[Location:bg] Failed to restart tracking:", err);
+            });
+          }
+        }, 5000); // Wait 5 seconds before retry
+      }
+    };
+
+    // Check periodically if tracking stopped unexpectedly
+    const intervalId = setInterval(checkAndRestart, 30000); // Check every 30 seconds
+    
+    return () => {
+      clearInterval(intervalId);
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+    };
+  }, [isTracking, isRequesting, user, startTracking]);
+
+  // Restart tracking when app becomes active if it should be tracking
+  useEffect(() => {
+    if (!isNativePlatform() || !user) return;
+    
+    const handleAppStateChange = async (state: { isActive: boolean }) => {
+      if (state.isActive && shouldBeTrackingRef.current && !isTracking && !isRequesting) {
+        console.log("[Location:bg] App became active, restarting tracking...");
+        // Small delay to ensure app is fully active
+        setTimeout(() => {
+          if (shouldBeTrackingRef.current && !isTracking) {
+            startTracking().catch((err) => {
+              console.error("[Location:bg] Failed to restart tracking on app active:", err);
+            });
+          }
+        }, 1000);
+      }
+    };
+
+    const listenerPromise = App.addListener("appStateChange", handleAppStateChange);
+    return () => {
+      listenerPromise.then((l) => l.remove()).catch(() => {});
+    };
+  }, [isTracking, isRequesting, user, startTracking]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -566,6 +664,9 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
           navigator.geolocation.clearWatch(watchIdRef.current);
         }
         watchIdRef.current = null;
+      }
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
       }
     };
   }, []);
@@ -1002,8 +1103,28 @@ function getInitials(displayName: string): string {
   return name.slice(0, 2).toUpperCase();
 }
 
+// Generate a color for a trip based on its ID (deterministic)
+const getTripColor = (tripId: string, index: number): string => {
+  // Use a palette of distinct colors
+  const colors = [
+    "#ef4444", // red
+    "#3b82f6", // blue
+    "#10b981", // green
+    "#f59e0b", // amber
+    "#8b5cf6", // purple
+    "#ec4899", // pink
+    "#06b6d4", // cyan
+    "#84cc16", // lime
+    "#f97316", // orange
+    "#6366f1", // indigo
+  ];
+  
+  // Use index modulo colors length for deterministic color assignment
+  return colors[index % colors.length];
+};
+
 export default forwardRef<MapHandle, MapProps>(function Map(
-  { user, locations, photos = [], friendLocations = [], onLocationUpdate, focusLocation, onPendingLocationsChange, onTrackingChange, onLocationSaved },
+  { user, locations, photos = [], friendLocations = [], trips = [], onLocationUpdate, focusLocation, onPendingLocationsChange, onTrackingChange, onLocationSaved },
   ref
 ) {
   const trackerRef = useRef<MapTrackingHandle | null>(null);
@@ -1088,15 +1209,28 @@ export default forwardRef<MapHandle, MapProps>(function Map(
     return groups;
   }, [photos, viewportThreshold, zoomLevel]);
 
-  // Filter out locations that fall within photo clusters
+  // Filter locations: if trips are active, only show trip-based locations
+  // Also filter out locations that fall within photo clusters
   const visibleLocations = useMemo((): Location[] => {
-    if (photoGroups.length === 0) return locations;
+    let filtered = locations;
+    
+    // If at least one trip is active, only show locations that belong to active trips
+    const activeTripIds = trips.filter(t => t.is_active).map(t => t.id);
+    if (activeTripIds.length > 0) {
+      filtered = locations.filter((location) => {
+        // Location must have trip_ids and at least one must be in activeTripIds
+        return location.trip_ids && location.trip_ids.some(id => activeTripIds.includes(id));
+      });
+    }
+    
+    // Filter out locations that fall within photo clusters
+    if (photoGroups.length === 0) return filtered;
     
     const threshold = Math.max(viewportThreshold, 0.00001);
     const excludedLocations = new Set<string>();
     
     // Check each location against each photo cluster
-    locations.forEach((location, index) => {
+    filtered.forEach((location, index) => {
       photoGroups.forEach((group) => {
         // For clusters, check distance from location to cluster center
         if (group.photos.length > 1) {
@@ -1125,8 +1259,56 @@ export default forwardRef<MapHandle, MapProps>(function Map(
       });
     });
     
-    return locations.filter((_, index) => !excludedLocations.has(`location-${index}`));
-  }, [locations, photoGroups, viewportThreshold]);
+    return filtered.filter((_, index) => !excludedLocations.has(`location-${index}`));
+  }, [locations, trips, photoGroups, viewportThreshold]);
+  
+  // Group locations by trip_id and create polylines for each trip
+  const tripPolylines = useMemo(() => {
+    const activeTripIds = trips.filter(t => t.is_active).map(t => t.id);
+    
+    // If no active trips, return empty array (will show default breadcrumb trail)
+    if (activeTripIds.length === 0) {
+      return [];
+    }
+    
+    // Group locations by trip_id (using plain object to avoid Map naming conflict)
+    const tripGroups: Record<string, Location[]> = {};
+    
+    visibleLocations.forEach((location) => {
+      if (location.trip_ids) {
+        location.trip_ids.forEach((tripId) => {
+          if (activeTripIds.includes(tripId)) {
+            if (!tripGroups[tripId]) {
+              tripGroups[tripId] = [];
+            }
+            tripGroups[tripId].push(location);
+          }
+        });
+      }
+    });
+    
+    // Create polyline data for each trip
+    const polylines: Array<{ tripId: string; tripName: string; color: string; positions: [number, number][] }> = [];
+    
+    trips.forEach((trip, index) => {
+      if (trip.is_active && tripGroups[trip.id]) {
+        const tripLocations = tripGroups[trip.id];
+        // Sort by timestamp to ensure correct order
+        tripLocations.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+        
+        if (tripLocations.length > 1) {
+          polylines.push({
+            tripId: trip.id,
+            tripName: trip.name,
+            color: getTripColor(trip.id, index),
+            positions: tripLocations.map((loc) => [loc.lat, loc.lng] as [number, number]),
+          });
+        }
+      }
+    });
+    
+    return polylines;
+  }, [visibleLocations, trips]);
 
   // Create sequential timeline connections between events (photos and locations)
   const timelineConnections = useMemo(() => {
@@ -1161,8 +1343,8 @@ export default forwardRef<MapHandle, MapProps>(function Map(
       });
     });
     
-    // Add locations to timeline
-    locations.forEach((location) => {
+    // Add locations to timeline (use visibleLocations which respects trip filtering)
+    visibleLocations.forEach((location) => {
       events.push({
         position: [location.lat, location.lng],
         timestamp: new Date(location.timestamp).getTime(),
@@ -1184,12 +1366,18 @@ export default forwardRef<MapHandle, MapProps>(function Map(
     console.log(`[Timeline] Created ${connections.length} sequential connections from ${events.length} events`);
     
     return connections;
-  }, [photoGroups, locations]);
+  }, [photoGroups, visibleLocations]);
 
-  // Use visibleLocations for path coordinates (calculated after filtering)
+  // Use visibleLocations for path coordinates (only if no active trips)
+  // If trips are active, we'll use tripPolylines instead
   const pathCoordinates: [number, number][] = useMemo(() => {
+    const activeTripIds = trips.filter(t => t.is_active).map(t => t.id);
+    // Only show default breadcrumb trail if no trips are active
+    if (activeTripIds.length > 0) {
+      return [];
+    }
     return visibleLocations.map((loc) => [loc.lat, loc.lng]);
-  }, [visibleLocations]);
+  }, [visibleLocations, trips]);
 
   return (
     <div className="w-full h-full relative">
@@ -1208,7 +1396,19 @@ export default forwardRef<MapHandle, MapProps>(function Map(
         <ZoomTracker onZoomChange={setZoomLevel} />
         <ViewportTracker onThresholdChange={setViewportThreshold} />
         
-        {/* Breadcrumb trail - continuous line connecting all points */}
+        {/* Trip-based polylines - different color per trip */}
+        {tripPolylines.map((polyline) => (
+          <Polyline
+            key={`trip-${polyline.tripId}`}
+            positions={polyline.positions}
+            color={polyline.color}
+            weight={4}
+            opacity={0.8}
+            smoothFactor={1}
+          />
+        ))}
+        
+        {/* Default breadcrumb trail - only shown when no trips are active */}
         {pathCoordinates.length > 1 && (
           <Polyline 
             positions={pathCoordinates} 
@@ -1238,6 +1438,18 @@ export default forwardRef<MapHandle, MapProps>(function Map(
           const isStart = index === 0;
           const isEnd = index === visibleLocations.length - 1;
           
+          // Determine color based on trip_ids if trips are active
+          let markerColor = "#3b82f6"; // default blue
+          const activeTripIds = trips.filter(t => t.is_active).map(t => t.id);
+          if (activeTripIds.length > 0 && location.trip_ids) {
+            // Find the first active trip this location belongs to
+            const matchingTrip = trips.find(t => t.is_active && location.trip_ids?.includes(t.id));
+            if (matchingTrip) {
+              const tripIndex = trips.findIndex(t => t.id === matchingTrip.id);
+              markerColor = getTripColor(matchingTrip.id, tripIndex);
+            }
+          }
+          
           // Use special icons for start and end, breadcrumb dots for the rest
           if (isStart && visibleLocations.length > 1) {
             return (
@@ -1256,24 +1468,37 @@ export default forwardRef<MapHandle, MapProps>(function Map(
               />
             );
           } else {
-            // Regular breadcrumb dots
+            // Regular breadcrumb dots with trip color if applicable
             return (
               <Marker
                 key={`breadcrumb-${index}`}
                 position={[location.lat, location.lng]}
-                icon={createBreadcrumbIcon("#3b82f6", 6)}
+                icon={createBreadcrumbIcon(markerColor, 6)}
               />
             );
           }
         })}
         
         {/* If only one visible location, show it as a regular marker */}
-        {visibleLocations.length === 1 && (
-          <Marker
-            position={[visibleLocations[0].lat, visibleLocations[0].lng]}
-            icon={createBreadcrumbIcon("#3b82f6", 8)}
-          />
-        )}
+        {visibleLocations.length === 1 && (() => {
+          const location = visibleLocations[0];
+          let markerColor = "#3b82f6"; // default blue
+          const activeTripIds = trips.filter(t => t.is_active).map(t => t.id);
+          if (activeTripIds.length > 0 && location.trip_ids) {
+            const matchingTrip = trips.find(t => t.is_active && location.trip_ids?.includes(t.id));
+            if (matchingTrip) {
+              const tripIndex = trips.findIndex(t => t.id === matchingTrip.id);
+              markerColor = getTripColor(matchingTrip.id, tripIndex);
+            }
+          }
+          return (
+            <Marker
+              key="single-location"
+              position={[location.lat, location.lng]}
+              icon={createBreadcrumbIcon(markerColor, 8)}
+            />
+          );
+        })()}
         
         {/* Photo location markers - clustered or individual */}
         {/* Key includes zoomLevel and group count to force complete re-render on zoom changes */}

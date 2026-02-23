@@ -11,47 +11,102 @@ import { getPendingPhotosForUser, addPendingPhoto } from "@/lib/localStore";
 import { compressImage } from "@/lib/imageCompression";
 import exifr from "exifr";
 
-// Lazy-load Media plugin to avoid initialization issues on app startup
+// Media plugin - must be loaded dynamically (synchronous require doesn't work properly)
 let Media: any = null;
 let mediaLoadAttempted = false;
 
 async function getMediaPlugin() {
+  console.log("[photoScanner] getMediaPlugin called", { 
+    mediaLoadAttempted, 
+    hasMedia: !!Media,
+    mediaType: typeof Media,
+    mediaKeys: Media ? Object.keys(Media) : [],
+    hasGetMedias: Media ? typeof Media.getMedias : "N/A"
+  });
+  
+  // If we already have Media from a previous load, verify it has getMedias
+  if (Media && typeof Media.getMedias === "function") {
+    console.log("[photoScanner] Using cached Media (has getMedias)");
+    return Media;
+  }
+  
   // Only attempt to load once
   if (mediaLoadAttempted) {
+    console.log("[photoScanner] Already attempted, returning cached Media:", !!Media);
     return Media;
   }
   
   mediaLoadAttempted = true;
+  console.log("[photoScanner] First time loading, setting mediaLoadAttempted = true");
   
   if (typeof window === "undefined") {
+    console.log("[photoScanner] window is undefined, returning null");
     return null;
   }
   
   try {
     // Ensure Capacitor is available and ready
+    console.log("[photoScanner] Checking Capacitor...");
     if (typeof Capacitor === "undefined") {
       console.warn("[photoScanner] Capacitor not available");
       return null;
     }
     
     // Check if we're on a native platform
+    console.log("[photoScanner] Checking if native platform...");
     if (!Capacitor.isNativePlatform()) {
+      console.log("[photoScanner] Not native platform");
       return null;
     }
     
-    // Dynamically import the Media plugin
+    // Try dynamic import
+    console.log("[photoScanner] Dynamically importing @capacitor-community/media...");
     const mediaModule = await import("@capacitor-community/media");
-    Media = mediaModule.Media;
+    console.log("[photoScanner] Media module imported:", !!mediaModule);
+    console.log("[photoScanner] Media module keys:", Object.keys(mediaModule));
     
-    // Verify Media plugin is available
+    // Try to get Media from the module
+    Media = mediaModule.Media || mediaModule.default || mediaModule;
+    console.log("[photoScanner] Media assigned:", !!Media, typeof Media);
+    
+    // If Media is still empty or doesn't have getMedias, try Capacitor registry
+    if (!Media || (typeof Media === "object" && Object.keys(Media).length === 0)) {
+      console.log("[photoScanner] Media is empty, trying Capacitor.Plugins...");
+      if ((window as any).Capacitor?.Plugins?.Media) {
+        Media = (window as any).Capacitor.Plugins.Media;
+        console.log("[photoScanner] Found Media in Capacitor.Plugins:", !!Media);
+      }
+    }
+    
+    // Verify Media plugin is available and has getMedias method
     if (!Media) {
       console.warn("[photoScanner] Media plugin not available after import");
       return null;
     }
     
-    return Media;
+    console.log("[photoScanner] Media object keys:", Object.keys(Media));
+    console.log("[photoScanner] Media.getMedias type:", typeof Media.getMedias);
+    
+    if (typeof Media.getMedias !== "function") {
+      console.error("[photoScanner] Media.getMedias is not a function!");
+      console.error("[photoScanner] Media object:", Media);
+      throw new Error("Media plugin does not have getMedias method");
+    }
+    
+    // Store Media in module-level cache
+    const cachedMedia = Media;
+    console.log("[photoScanner] Media plugin loaded successfully, cachedMedia:", !!cachedMedia);
+    console.log("[photoScanner] About to return from getMediaPlugin");
+    
+    // Use setTimeout to ensure promise resolves in next tick (workaround for potential promise resolution issues)
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        console.log("[photoScanner] Resolving promise with Media");
+        resolve(cachedMedia);
+      }, 0);
+    });
   } catch (error) {
-    console.warn("[photoScanner] Failed to load Media plugin:", error);
+    console.error("[photoScanner] Failed to load Media plugin:", error);
     return null;
   }
 }
@@ -179,41 +234,149 @@ function base64ToBlob(base64: string, mimeType: string = "image/jpeg"): Blob {
   return new Blob([byteArray], { type: mimeType });
 }
 
+export interface ScannedPhoto {
+  identifier: string;
+  latitude: number | null;
+  longitude: number | null;
+  timestamp: string;
+  thumbnailUrl?: string;
+  // Lazy-loaded full image data (only loaded when adding photos)
+  _fullImageBlob?: Blob;
+  _fullImageFile?: File;
+}
+
 /**
- * Scan for new photos from device library and add them to the app
+ * Load full image for a scanned photo (lazy loading)
+ */
+async function loadFullImage(MediaPlugin: any, identifier: string): Promise<{ blob: Blob; file: File }> {
+  if (Capacitor.getPlatform() === "ios") {
+    // On iOS, get the full-quality image path using the identifier
+    const mediaPath = await MediaPlugin.getMediaByIdentifier({
+      identifier,
+    });
+    
+    // Read the file using Filesystem plugin
+    const fileData = await Filesystem.readFile({
+      path: mediaPath.path,
+    });
+
+    // Convert base64 to blob
+    const blob = base64ToBlob(fileData.data as string, "image/jpeg");
+    const file = new File([blob], `photo-${identifier}.jpg`, {
+      type: "image/jpeg",
+    });
+    return { blob, file };
+  } else {
+    // On Android, the identifier IS the path
+    // Read the file directly
+    const fileData = await Filesystem.readFile({
+      path: identifier,
+    });
+
+    const blob = base64ToBlob(fileData.data as string, "image/jpeg");
+    const file = new File([blob], `photo-${identifier}.jpg`, {
+      type: "image/jpeg",
+    });
+    return { blob, file };
+  }
+}
+
+/**
+ * Scan for new photos from device library and return them for user selection
  * Uses the Media plugin for programmatic access to photos
  */
-export async function scanForNewPhotos(userId: string): Promise<number> {
+export async function scanForNewPhotos(userId: string): Promise<ScannedPhoto[]> {
+  console.log("[photoScanner] scanForNewPhotos called", { userId, isNative: isNativePlatform() });
+  
   if (!isNativePlatform()) {
     // Only works on native platforms
-    return 0;
+    console.log("[photoScanner] Not native platform, returning empty array");
+    return [];
   }
 
+  console.log("[photoScanner] Starting scan...");
+  
   try {
     // Lazy-load Media plugin
-    const MediaPlugin = await getMediaPlugin();
+    console.log("[photoScanner] Loading Media plugin...");
+    let MediaPlugin: any;
+    try {
+      console.log("[photoScanner] About to await getMediaPlugin()...");
+      MediaPlugin = await getMediaPlugin();
+      console.log("[photoScanner] Await completed! Media plugin loaded:", !!MediaPlugin, typeof MediaPlugin);
+    } catch (error) {
+      console.error("[photoScanner] Error loading Media plugin:", error);
+      throw error;
+    }
+    
     if (!MediaPlugin) {
       console.warn("[photoScanner] Media plugin not available");
-      return 0;
+      return [];
     }
 
+    // Check if getMedias method exists
+    console.log("[photoScanner] Checking MediaPlugin methods...");
+    console.log("[photoScanner] MediaPlugin type:", typeof MediaPlugin);
+    console.log("[photoScanner] MediaPlugin.getMedias exists:", typeof MediaPlugin.getMedias);
+    console.log("[photoScanner] MediaPlugin methods:", Object.keys(MediaPlugin));
+    
+    if (typeof MediaPlugin.getMedias !== "function") {
+      console.error("[photoScanner] getMedias is not a function on MediaPlugin!");
+      console.error("[photoScanner] MediaPlugin:", MediaPlugin);
+      throw new Error("MediaPlugin.getMedias is not available");
+    }
+
+    console.log("[photoScanner] Getting last scan timestamp...");
     const lastScanTimestamp = await getLastPhotoScanTimestamp();
-    const lastScanDate = lastScanTimestamp > 0 ? new Date(lastScanTimestamp) : new Date(0);
+    console.log("[photoScanner] Last scan timestamp:", lastScanTimestamp);
 
     // Get recent photos from device library (last 100 photos, sorted by creation date descending)
     // This will get photos newer than our last scan
-    const result = await MediaPlugin.getMedias({
-      quantity: 100,
-      types: "photos",
-      sort: [{ key: "creationDate", ascending: false }],
-      thumbnailWidth: 1024, // Get larger thumbnails for better quality
-      thumbnailHeight: 1024,
-      thumbnailQuality: 90,
+    console.log("[photoScanner] Calling MediaPlugin.getMedias...");
+    let getMediasPromise: Promise<any>;
+    try {
+      console.log("[photoScanner] About to call getMedias with options:", {
+        quantity: 100,
+        types: "photos",
+        sort: [{ key: "creationDate", ascending: false }],
+      });
+      getMediasPromise = MediaPlugin.getMedias({
+        quantity: 100,
+        types: "photos",
+        sort: [{ key: "creationDate", ascending: false }],
+        thumbnailWidth: 512, // Smaller thumbnails for faster loading
+        thumbnailHeight: 512,
+        thumbnailQuality: 80,
+      });
+      console.log("[photoScanner] getMedias called, promise created:", !!getMediasPromise);
+    } catch (error) {
+      console.error("[photoScanner] Error calling getMedias:", error);
+      throw error;
+    }
+    
+    console.log("[photoScanner] Setting up timeout (30s)...");
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => {
+        console.error("[photoScanner] Timeout reached!");
+        reject(new Error("Photo scanning timed out after 30 seconds"));
+      }, 30000);
     });
+    
+    console.log("[photoScanner] Waiting for getMedias or timeout...");
+    let result: any;
+    try {
+      result = await Promise.race([getMediasPromise, timeoutPromise]);
+      console.log("[photoScanner] Promise resolved!");
+    } catch (error) {
+      console.error("[photoScanner] Error in Promise.race:", error);
+      throw error;
+    }
+
+    console.log(`[photoScanner] getMedias returned ${result?.medias?.length || 0} photos`);
 
     if (!result.medias || result.medias.length === 0) {
       console.log("[photoScanner] No photos found in library");
-      return 0;
+      return [];
     }
 
     const existingPhotos = await getPendingPhotosForUser(userId);
@@ -225,18 +388,9 @@ export async function scanForNewPhotos(userId: string): Promise<number> {
       })
     );
 
-    // Also track identifiers to avoid duplicates
-    const existingIdentifiers = new Set(
-      existingPhotos.map((p) => {
-        // Try to extract identifier from photo ID if it contains one
-        // This is a fallback - we primarily use timestamps
-        return p.id;
-      })
-    );
+    const scannedPhotos: ScannedPhoto[] = [];
 
-    let addedCount = 0;
-
-    // Process each photo
+    // Process each photo (using thumbnails only for now)
     for (const media of result.medias) {
       try {
         const creationDate = new Date(media.creationDate);
@@ -249,40 +403,8 @@ export async function scanForNewPhotos(userId: string): Promise<number> {
         // Check if this photo is a duplicate by timestamp
         const timestampSeconds = Math.floor(creationDate.getTime() / 1000);
         if (existingTimestamps.has(timestampSeconds)) {
-          console.log("[photoScanner] Skipping duplicate photo by timestamp", media.creationDate);
           continue;
         }
-
-        // Get full-quality image
-        let imageBlob: Blob;
-        let imageFile: File;
-
-        if (Capacitor.getPlatform() === "ios") {
-          // On iOS, get the full-quality image path using the identifier
-          const mediaPath = await MediaPlugin.getMediaByIdentifier({
-            identifier: media.identifier,
-          });
-          
-          // Read the file using Filesystem plugin
-          const fileData = await Filesystem.readFile({
-            path: mediaPath.path,
-          });
-
-          // Convert base64 to blob
-          imageBlob = base64ToBlob(fileData.data as string, "image/jpeg");
-        } else {
-          // On Android, the identifier IS the path
-          // Read the file directly
-          const fileData = await Filesystem.readFile({
-            path: media.identifier,
-          });
-
-          imageBlob = base64ToBlob(fileData.data as string, "image/jpeg");
-        }
-
-        imageFile = new File([imageBlob], `photo-${media.identifier}.jpg`, {
-          type: "image/jpeg",
-        });
 
         // Extract GPS coordinates from media location if available
         let latitude: number | null = null;
@@ -290,20 +412,128 @@ export async function scanForNewPhotos(userId: string): Promise<number> {
         if (media.location) {
           latitude = media.location.latitude;
           longitude = media.location.longitude;
-        } else {
-          // Try to extract from EXIF as fallback
+        }
+
+        // Use creation date from media
+        let photoTimestamp = media.creationDate;
+        if (!photoTimestamp || photoTimestamp === "Invalid Date") {
+          photoTimestamp = new Date().toISOString();
+        }
+
+        // Use thumbnail from Media plugin response if available
+        let thumbnailUrl: string | undefined;
+        try {
+          if (media.thumbnail) {
+            // Thumbnail is base64 data URL or path
+            if (typeof media.thumbnail === "string") {
+              if (media.thumbnail.startsWith("data:")) {
+                thumbnailUrl = media.thumbnail;
+              } else {
+                // It's a path, convert it
+                try {
+                  const thumbnailData = await Filesystem.readFile({
+                    path: media.thumbnail,
+                  });
+                  thumbnailUrl = `data:image/jpeg;base64,${thumbnailData.data}`;
+                } catch (e) {
+                  console.warn("[photoScanner] Failed to load thumbnail from path:", e);
+                }
+              }
+            } else if (media.thumbnail.base64) {
+              // Thumbnail might be an object with base64 property
+              thumbnailUrl = `data:image/jpeg;base64,${media.thumbnail.base64}`;
+            }
+          }
+          
+          // Fallback: if no thumbnail, we'll show a placeholder in the UI
+          // Loading full images here would be too slow
+        } catch (e) {
+          console.warn("[photoScanner] Error processing thumbnail:", e);
+        }
+
+        scannedPhotos.push({
+          identifier: media.identifier,
+          latitude,
+          longitude,
+          timestamp: photoTimestamp,
+          thumbnailUrl,
+        });
+      } catch (error) {
+        console.error("[photoScanner] Error processing photo:", error);
+        // Continue with next photo
+      }
+    }
+
+    console.log(`[photoScanner] Found ${scannedPhotos.length} new photos`);
+    return scannedPhotos;
+  } catch (error) {
+    console.error("[photoScanner] Error scanning photos:", error);
+    // Check if it's a permission error or other recoverable error
+    if (error instanceof Error) {
+      const errorMsg = error.message.toLowerCase();
+      if (errorMsg.includes("permission") || errorMsg.includes("denied")) {
+        console.warn("[photoScanner] Photo library permission not granted");
+        throw new Error("Photo library permission not granted. Please grant permission in Settings.");
+      } else if (errorMsg.includes("unimplemented") || errorMsg.includes("not available")) {
+        console.warn("[photoScanner] getMedias not available on this platform");
+        throw new Error("Photo scanning is not available on this platform.");
+      } else {
+        console.error("[photoScanner] Unexpected error:", error);
+        throw error;
+      }
+    } else {
+      console.error("[photoScanner] Unknown error:", error);
+      throw error;
+    }
+  }
+}
+
+/**
+ * Add selected photos to the app and update last scan timestamp
+ */
+export async function addSelectedPhotos(
+  userId: string,
+  photos: ScannedPhoto[],
+  tripIds?: string[]
+): Promise<number> {
+  if (!isNativePlatform()) {
+    return 0;
+  }
+
+  const MediaPlugin = await getMediaPlugin();
+  if (!MediaPlugin) {
+    throw new Error("Media plugin not available");
+  }
+
+  let addedCount = 0;
+
+  for (const scannedPhoto of photos) {
+    try {
+      // Load full image if not already loaded
+      let imageFile: File;
+      if (scannedPhoto._fullImageFile) {
+        imageFile = scannedPhoto._fullImageFile;
+      } else {
+        console.log(`[photoScanner] Loading full image for ${scannedPhoto.identifier}...`);
+        const { file } = await loadFullImage(MediaPlugin, scannedPhoto.identifier);
+        imageFile = file;
+        
+        // Try to extract GPS from EXIF if not already set
+        let latitude = scannedPhoto.latitude;
+        let longitude = scannedPhoto.longitude;
+        if (!latitude || !longitude) {
           const exifData = await extractExifData(imageFile);
           if (exifData.latitude && exifData.longitude) {
             latitude = exifData.latitude;
             longitude = exifData.longitude;
           }
         }
-
-        // Use creation date from media, or fallback to EXIF timestamp
-        let photoTimestamp = media.creationDate;
-        if (!photoTimestamp || photoTimestamp === "Invalid Date") {
-          const exifData = await extractExifData(imageFile);
-          photoTimestamp = exifData.timestamp ?? new Date().toISOString();
+        
+        // Update timestamp from EXIF if needed
+        let timestamp = scannedPhoto.timestamp;
+        const exifData = await extractExifData(imageFile);
+        if (exifData.timestamp) {
+          timestamp = exifData.timestamp;
         }
 
         // Compress the image
@@ -314,40 +544,24 @@ export async function scanForNewPhotos(userId: string): Promise<number> {
           user_id: userId,
           latitude,
           longitude,
-          timestamp: photoTimestamp,
+          timestamp,
           blob: compressedFile,
+          trip_ids: tripIds && tripIds.length > 0 ? tripIds : undefined,
         });
 
         addedCount++;
-      } catch (error) {
-        console.error("[photoScanner] Error processing photo:", error);
-        // Continue with next photo
       }
+    } catch (error) {
+      console.error(`[photoScanner] Error adding photo ${scannedPhoto.identifier}:`, error);
     }
-
-    // Update last scan timestamp
-    await setLastPhotoScanTimestamp(Date.now());
-
-    console.log(`[photoScanner] Added ${addedCount} new photos`);
-    return addedCount;
-  } catch (error) {
-    console.error("[photoScanner] Error scanning photos:", error);
-    // Check if it's a permission error or other recoverable error
-    if (error instanceof Error) {
-      const errorMsg = error.message.toLowerCase();
-      if (errorMsg.includes("permission") || errorMsg.includes("denied")) {
-        console.warn("[photoScanner] Photo library permission not granted");
-      } else if (errorMsg.includes("unimplemented") || errorMsg.includes("not available")) {
-        console.warn("[photoScanner] getMedias not available on this platform");
-      } else {
-        console.error("[photoScanner] Unexpected error:", error);
-      }
-    } else {
-      console.error("[photoScanner] Unknown error:", error);
-    }
-    // Always return 0 on error to prevent app crash
-    return 0;
   }
+
+  // Update last scan timestamp after successfully adding photos
+  if (addedCount > 0) {
+    await setLastPhotoScanTimestamp(Date.now());
+  }
+
+  return addedCount;
 }
 
 /**

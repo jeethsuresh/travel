@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { collection, query, where, orderBy, limit, startAfter, getDocs, type DocumentSnapshot } from "firebase/firestore";
+import { collection, query, where, orderBy, limit, startAfter, getDocs, Timestamp, type DocumentSnapshot } from "firebase/firestore";
 import dynamicImport from "next/dynamic";
 import Auth from "@/components/Auth";
 import FriendsPanel from "@/components/FriendsPanel";
@@ -29,7 +29,6 @@ import { subscribeTrips, getActiveTrips, type Trip } from "@/lib/firebase/trips"
 import { isNativePlatform } from "@/lib/capacitor";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
-import { scanForNewPhotos, shouldScanForPhotos } from "@/lib/photoScanner";
 import type { MapHandle } from "@/components/Map";
 
 // Dynamically import Map component to prevent SSR issues with Leaflet
@@ -44,6 +43,7 @@ interface Location {
   longitude: number;
   timestamp: string;
   wait_time?: number;
+  trip_ids?: string[];
 }
 
 interface Photo {
@@ -223,8 +223,11 @@ export default function Home() {
             id: doc.id,
             latitude: d.latitude ?? 0,
             longitude: d.longitude ?? 0,
-            timestamp: d.timestamp ?? "",
+            timestamp: d.timestamp instanceof Timestamp
+              ? d.timestamp.toDate().toISOString()
+              : String(d.timestamp ?? ""),
             wait_time: d.wait_time,
+            trip_ids: d.trip_ids,
           });
         });
         newLastVisible = firestoreSnap.docs[firestoreSnap.docs.length - 1];
@@ -239,6 +242,7 @@ export default function Home() {
         longitude: p.longitude,
         timestamp: p.timestamp,
         wait_time: p.wait_time,
+        trip_ids: p.trip_ids,
       }));
       setPendingLocations(pendingAsLocations);
     } catch (error) {
@@ -273,8 +277,11 @@ export default function Home() {
           id: doc.id,
           latitude: d.latitude ?? 0,
           longitude: d.longitude ?? 0,
-          timestamp: d.timestamp ?? "",
+          timestamp: d.timestamp instanceof Timestamp
+            ? d.timestamp.toDate().toISOString()
+            : String(d.timestamp ?? ""),
           wait_time: d.wait_time,
+          trip_ids: d.trip_ids,
         });
       });
       setRemoteLocations((prev) => [...prev, ...next]);
@@ -432,14 +439,10 @@ export default function Home() {
   }, [user?.id, userDisplayName, locations.length, locations[0]?.timestamp]);
 
   // On app active: apply uploadedIds from runner (remove from IndexedDB and refetch)
-  // Also scan for new photos from device library
   useEffect(() => {
     if (!isNativePlatform()) {
       return;
     }
-    
-    // Track if this is the first activation to avoid scanning on initial load
-    const isFirstActivationRef = { current: true };
     
     const listenerPromise = App.addListener("appStateChange", async (state) => {
       if (state.isActive) {
@@ -452,29 +455,6 @@ export default function Home() {
             await Preferences.remove({ key: "jeethtravel.uploadedIds" });
             fetchLocations();
           }
-
-          // Scan for new photos from device library (skip on first activation to avoid blocking app startup)
-          if (user?.id && !isFirstActivationRef.current) {
-            const shouldScan = await shouldScanForPhotos();
-            if (shouldScan) {
-              // Small delay to let the app fully come to foreground
-              setTimeout(async () => {
-                try {
-                  const addedCount = await scanForNewPhotos(user.id);
-                  if (addedCount > 0) {
-                    // Refresh photos list and map if new photos were added
-                    fetchPhotos();
-                    fetchLocations(); // Refresh locations in case photos have GPS data
-                  }
-                } catch (error) {
-                  console.warn("[PhotoScanner] Error scanning photos on foreground:", error);
-                }
-              }, 1000); // Increased delay to ensure app is fully ready
-            }
-          }
-          
-          // Mark that we've handled the first activation
-          isFirstActivationRef.current = false;
         } catch (e) {
           console.warn("[Location:uploadedIds] apply failed", e);
         }
@@ -485,7 +465,7 @@ export default function Home() {
     return () => {
       listenerPromise.then((l) => l.remove()).catch(() => {});
     };
-  }, [syncPendingToPreferencesForRunner, fetchLocations, fetchPhotos, user?.id]);
+  }, [syncPendingToPreferencesForRunner, fetchLocations]);
 
   useEffect(() => {
     return () => {
@@ -548,9 +528,11 @@ export default function Home() {
             lng: loc.longitude,
             timestamp: loc.timestamp,
             wait_time: loc.wait_time,
+            trip_ids: loc.trip_ids,
           }))}
           photos={photos}
           friendLocations={friendLocations}
+          trips={activeTrips}
           onLocationUpdate={fetchLocations}
           focusLocation={focusLocation}
           onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
@@ -559,23 +541,6 @@ export default function Home() {
         />
       </div>
 
-      {/* Top-center: Active trips display */}
-      {user && activeTrips.length > 0 && (
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 z-10 p-3 safe-area-top">
-          <Card className="border-border/80 bg-card/95 shadow-lg backdrop-blur-sm">
-            <CardContent className="pt-3 px-4 pb-3">
-              <div className="flex items-center gap-2 flex-wrap justify-center">
-                <span className="text-xs text-muted-foreground">Active trips:</span>
-                {activeTrips.map((trip) => (
-                  <span key={trip.id} className="text-xs font-medium px-2 py-1 bg-primary/10 text-primary rounded">
-                    {trip.name}
-                  </span>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
 
       {/* Top-left: map title + navigation (only when signed in) */}
       {user && (
@@ -584,30 +549,47 @@ export default function Home() {
             <CardHeader className="pb-2 pt-3 px-3">
               <CardTitle className="text-base font-semibold">Map</CardTitle>
             </CardHeader>
-            <CardContent className="flex items-center gap-1 pt-0 px-3 pb-3">
+            <CardContent className="flex flex-col items-center gap-1 pt-0 px-3 pb-3">
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => mapRef.current?.zoomIn?.()}
+                  aria-label="Zoom in"
+                >
+                  <span className="text-lg font-semibold leading-none">+</span>
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => mapRef.current?.zoomOut?.()}
+                  aria-label="Zoom out"
+                >
+                  <span className="text-lg font-semibold leading-none">−</span>
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => mapRef.current?.flyToCurrentLocation?.()}
+                  aria-label="My location"
+                >
+                  <span className="text-sm">⌖</span>
+                </Button>
+              </div>
               <Button
-                variant="secondary"
+                variant={trackingState.isTracking ? "destructive" : "secondary"}
                 size="icon"
-                onClick={() => mapRef.current?.zoomIn?.()}
-                aria-label="Zoom in"
+                onClick={() => mapRef.current?.toggleTracking?.()}
+                disabled={trackingState.isRequesting}
+                className={
+                  !trackingState.isTracking && !trackingState.isRequesting
+                    ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                    : ""
+                }
+                aria-label={trackingState.isRequesting ? "Requesting" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
+                title={trackingState.isRequesting ? "Requesting…" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
               >
-                <span className="text-lg font-semibold leading-none">+</span>
-              </Button>
-              <Button
-                variant="secondary"
-                size="icon"
-                onClick={() => mapRef.current?.zoomOut?.()}
-                aria-label="Zoom out"
-              >
-                <span className="text-lg font-semibold leading-none">−</span>
-              </Button>
-              <Button
-                variant="secondary"
-                size="icon"
-                onClick={() => mapRef.current?.flyToCurrentLocation?.()}
-                aria-label="My location"
-              >
-                <span className="text-sm">⌖</span>
+                <span className="text-xs">{trackingState.isRequesting ? "…" : trackingState.isTracking ? "⏹" : "▶"}</span>
               </Button>
             </CardContent>
           </Card>
@@ -637,28 +619,34 @@ export default function Home() {
         />
       )}
 
-      {/* Bottom bar: Start tracking + Location History */}
+      {/* Bottom bar: Active trips + Location History */}
       {user && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex justify-center gap-3 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
-          <Button
-            onClick={() => mapRef.current?.toggleTracking?.()}
-            disabled={trackingState.isRequesting}
-            variant={trackingState.isTracking ? "destructive" : "default"}
-            className={
-              !trackingState.isTracking
-                ? "bg-emerald-600 hover:bg-emerald-700 text-white"
-                : ""
-            }
-          >
-            {trackingState.isRequesting ? "Requesting…" : trackingState.isTracking ? "Stop tracking" : "Start tracking"}
-          </Button>
-          <Button
-            variant="secondary"
-            className="bg-card/95 shadow-lg backdrop-blur-sm border-border/80"
-            onClick={() => setLocationHistoryOpen(true)}
-          >
-            Location history
-          </Button>
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-2 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
+          {activeTrips.length > 0 && (
+            <div className="flex justify-center">
+              <Card className="border-border/80 bg-card/95 shadow-lg backdrop-blur-sm">
+                <CardContent className="pt-3 px-4 pb-3">
+                  <div className="flex items-center gap-2 flex-wrap justify-center">
+                    <span className="text-xs text-muted-foreground">Active trips:</span>
+                    {activeTrips.map((trip) => (
+                      <span key={trip.id} className="text-xs font-medium px-2 py-1 bg-primary/10 text-primary rounded">
+                        {trip.name}
+                      </span>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          )}
+          <div className="flex justify-center">
+            <Button
+              variant="secondary"
+              className="bg-card/95 shadow-lg backdrop-blur-sm border-border/80"
+              onClick={() => setLocationHistoryOpen(true)}
+            >
+              Location history
+            </Button>
+          </div>
         </div>
       )}
 
