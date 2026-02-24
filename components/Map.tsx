@@ -13,10 +13,15 @@ import {
 import { getActiveTrips, type Trip } from "@/lib/firebase/trips";
 import { uploadLocationToFirestore, updateLocationInFirestore } from "@/lib/firebase/locations";
 import { getFirebaseFirestore } from "@/lib/firebase";
-import { Geolocation } from "@capacitor/geolocation";
 import { App } from "@capacitor/app";
 import { Preferences } from "@capacitor/preferences";
 import { isNativePlatform } from "@/lib/capacitor";
+import {
+  startTrackingNative,
+  stopTrackingNative,
+  getCurrentLocationNative,
+  getAllLocationsNative,
+} from "@/lib/capacitor/location";
 
 // Fix for default marker icons in Next.js - only run on client
 if (typeof window !== "undefined") {
@@ -100,6 +105,7 @@ interface Location {
   timestamp: string;
   wait_time?: number;
   trip_ids?: string[];
+  uploaded?: boolean;
 }
 
 interface Photo {
@@ -130,7 +136,7 @@ interface MapProps {
   trips?: Trip[];
   onLocationUpdate: () => void;
   focusLocation?: { latitude: number; longitude: number } | null;
-  /** Called when pending locations change so the page can sync to Preferences for the background runner */
+  /** Called when pending locations change so the page can sync to Preferences for the native background task */
   onPendingLocationsChange?: () => void;
   /** Called when tracking state changes (for overlay UI) */
   onTrackingChange?: (state: Omit<MapTrackingHandle, "toggleTracking">) => void;
@@ -148,14 +154,10 @@ const isIOSSafari = () => {
   return iOS && webkit && !chrome;
 };
 
-// Check geolocation permission status (native uses Capacitor Geolocation)
+// Check geolocation permission status (web only; native handled by Swift)
 const checkPermissionStatus = async (): Promise<PermissionState | null> => {
   if (typeof window === "undefined") return null;
   try {
-    if (isNativePlatform()) {
-      const { location } = await Geolocation.checkPermissions();
-      return location === "granted" ? "granted" : location === "denied" ? "denied" : null;
-    }
     if (!navigator.permissions) return null;
     const result = await navigator.permissions.query({ name: "geolocation" as PermissionName });
     return result.state;
@@ -269,7 +271,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
   }, []);
 
   // Retry Firestore upload when db is initially null (e.g. Firebase still initializing).
-  // Runs the upload when db becomes available, then calls onSync so the background runner can upload if we still fail.
+  // Runs the upload when db becomes available, then calls onSync so the native background task can upload if we still fail.
   const firestoreUploadWithRetry = useCallback(
     async (
       doUpload: (db: NonNullable<ReturnType<typeof getFirebaseFirestore>>) => Promise<void>,
@@ -285,13 +287,13 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
             await doUpload(db);
             return;
           } catch (error) {
-            console.error("[Location:update] Firestore upload failed (will sync to runner)", error);
+            console.error("[Location:update] Firestore upload failed (will sync to Preferences)", error);
             onSync();
             return;
           }
         }
       }
-      console.warn("[Location:update] Firestore not available after retries; pending synced to Preferences for background runner");
+      console.warn("[Location:update] Firestore not available after retries; pending synced to Preferences for native background");
       onSync();
     },
     []
@@ -336,7 +338,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
               trip_ids: tripIds.length > 0 ? tripIds : undefined,
             });
             
-            // Upload update to Firestore (retry if db null); sync to Preferences so runner can upload if we skip/fail
+            // Upload update to Firestore (retry if db null); sync to Preferences so native background can upload if we skip/fail
             await firestoreUploadWithRetry(
               (db) =>
                 updateLocationInFirestore(db, lastLocationRef.current!.id, {
@@ -382,7 +384,7 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
         trip_ids: tripIds.length > 0 ? tripIds : undefined,
       });
       
-      // Upload to Firestore (retry if db null); sync to Preferences so runner can upload if we skip/fail
+      // Upload to Firestore (retry if db null); sync to Preferences so native background can upload if we skip/fail
       await firestoreUploadWithRetry(
         (db) => uploadLocationToFirestore(db, pending),
         () => onPendingLocationsChange?.()
@@ -447,6 +449,28 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
       lastLocationRef.current = null;
     }
 
+    if (isNativePlatform()) {
+      try {
+        await startTrackingNative();
+        // Optimistically treat as granted; native plugin will enforce authorization.
+        setIsTracking(true);
+        setIsRequesting(false);
+        setPermissionStatus("granted");
+
+        const nativeLoc = await getCurrentLocationNative();
+        if (nativeLoc) {
+          setCurrentLocation({ lat: nativeLoc.lat, lng: nativeLoc.lng });
+        }
+        shouldBeTrackingRef.current = true;
+      } catch (err) {
+        setIsRequesting(false);
+        setIsTracking(false);
+        setError(err instanceof Error ? err.message : "Unable to get your location.");
+        setPermissionStatus("denied");
+      }
+      return;
+    }
+
     const geoOptions: PositionOptions = {
       enableHighAccuracy: true,
       maximumAge: isIOSSafari() ? 10000 : 0,
@@ -461,79 +485,9 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
 
     const clearWatchRef = () => {
       if (watchIdRef.current === null) return;
-      if (typeof watchIdRef.current === "string") {
-        Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
-      } else {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-      }
+      navigator.geolocation.clearWatch(watchIdRef.current as number);
       watchIdRef.current = null;
     };
-
-    if (isNativePlatform()) {
-      // Use Capacitor Geolocation so native CLLocationManager can deliver updates in background
-      // (with "Always" permission and UIBackgroundModes location). Web navigator.geolocation is suspended when backgrounded.
-      try {
-        await Geolocation.requestPermissions();
-        const pos = await Geolocation.getCurrentPosition(geoOptions);
-        const { latitude, longitude } = pos.coords;
-        setCurrentLocation({ lat: latitude, lng: longitude });
-        saveLocation(latitude, longitude);
-        setIsTracking(true);
-        setIsRequesting(false);
-        setPermissionStatus("granted");
-
-        const watchOptions: PositionOptions = {
-          enableHighAccuracy: true,
-          maximumAge: isIOSSafari() ? 5000 : 0,
-          timeout: isIOSSafari() ? 15000 : 10000,
-        };
-        const callbackId = await Geolocation.watchPosition(
-          watchOptions,
-          (position, err) => {
-            if (err) {
-              // Don't stop tracking for transient errors - only for permission denied
-              const errorCode = (err as any)?.code;
-              const errorMessage = (err as any)?.errorMessage ?? (err as any)?.message;
-              if (errorCode === 1 || errorCode === 'PERMISSION_DENIED') {
-                console.error("[Location:bg] Permission denied, stopping tracking");
-                setError("Location permission was denied. Please enable location access.");
-                setIsTracking(false);
-                shouldBeTrackingRef.current = false;
-                clearWatchRef();
-                return;
-              }
-              // OS-PLUG-GLOC-0002 / locationUnavailable is expected when app is backgrounded;
-              // native plugin keeps watch callbacks alive and will deliver again when a fix is available.
-              if (errorCode === 'OS-PLUG-GLOC-0002' || errorMessage?.includes('backgrounding')) {
-                console.warn("[Location:bg] Location temporarily unavailable (e.g. in background); watch remains active.");
-              } else {
-                console.error("[Location:bg] Error watching location (native):", err);
-                console.warn("[Location:bg] Transient error, will retry:", err);
-              }
-              setError(null); // Clear error for transient issues
-              return;
-            }
-            if (position?.coords) {
-              // Clear any previous errors on successful update
-              setError(null);
-              console.log("[Location:bg] native watchPosition update", {
-                lat: position.coords.latitude,
-                lng: position.coords.longitude,
-              });
-              onPosition(position.coords.latitude, position.coords.longitude);
-            }
-          }
-        );
-        watchIdRef.current = callbackId;
-        shouldBeTrackingRef.current = true;
-      } catch (err) {
-        setIsRequesting(false);
-        setIsTracking(false);
-        setError(err instanceof Error ? err.message : "Unable to get your location.");
-        setPermissionStatus("denied");
-      }
-      return;
-    }
 
     // Web: navigator.geolocation (suspended when app is backgrounded on iOS)
     navigator.geolocation.getCurrentPosition(
@@ -619,12 +573,10 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
       clearTimeout(retryTimeoutRef.current);
       retryTimeoutRef.current = null;
     }
-    if (watchIdRef.current !== null) {
-      if (typeof watchIdRef.current === "string") {
-        Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
-      } else {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-      }
+    if (isNativePlatform()) {
+      stopTrackingNative().catch(() => {});
+    } else if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current as number);
       watchIdRef.current = null;
     }
     lastLocationRef.current = null;
@@ -696,10 +648,8 @@ const LocationTracker = forwardRef<MapTrackingHandle, {
   useEffect(() => {
     return () => {
       if (watchIdRef.current !== null) {
-        if (typeof watchIdRef.current === "string") {
-          Geolocation.clearWatch({ id: watchIdRef.current }).catch(() => {});
-        } else {
-          navigator.geolocation.clearWatch(watchIdRef.current);
+        if (!isNativePlatform()) {
+          navigator.geolocation.clearWatch(watchIdRef.current as number);
         }
         watchIdRef.current = null;
       }
@@ -1183,9 +1133,34 @@ export default forwardRef<MapHandle, MapProps>(function Map(
   const [mapCenter, setMapCenter] = useState<[number, number]>([51.505, -0.09]); // Default to London
   const [zoomLevel, setZoomLevel] = useState<number>(13);
   const [viewportThreshold, setViewportThreshold] = useState<number>(0.0004); // Default threshold
+  const [nativeLocations, setNativeLocations] = useState<Location[]>([]);
+
+  const refreshNativeLocations = useCallback(async () => {
+    if (!isNativePlatform() || !user) return;
+    try {
+      const native = await getAllLocationsNative();
+      const mapped: Location[] = native.map((loc) => ({
+        lat: loc.latitude,
+        lng: loc.longitude,
+        timestamp: loc.timestamp,
+        wait_time: loc.wait_time,
+        trip_ids: loc.trip_ids,
+        uploaded: loc.uploaded ?? true,
+      }));
+      setNativeLocations(mapped);
+    } catch (err) {
+      console.error("[Map] Failed to load native locations from Preferences", err);
+    }
+  }, [user]);
 
   useEffect(() => {
-    if (navigator.geolocation && locations.length === 0) {
+    if (!isNativePlatform() || !user) return;
+    void refreshNativeLocations();
+  }, [refreshNativeLocations, user]);
+
+  useEffect(() => {
+    const effectiveLocations = isNativePlatform() ? nativeLocations : locations;
+    if (typeof navigator !== "undefined" && navigator.geolocation && effectiveLocations.length === 0) {
       navigator.geolocation.getCurrentPosition(
         (position) => {
           setMapCenter([position.coords.latitude, position.coords.longitude]);
@@ -1194,11 +1169,11 @@ export default forwardRef<MapHandle, MapProps>(function Map(
           // Use default center if geolocation fails
         }
       );
-    } else if (locations.length > 0) {
-      const lastLocation = locations[locations.length - 1];
+    } else if (effectiveLocations.length > 0) {
+      const lastLocation = effectiveLocations[effectiveLocations.length - 1];
       setMapCenter([lastLocation.lat, lastLocation.lng]);
     }
-  }, [locations]);
+  }, [locations, nativeLocations]);
 
   // Focus on photo location when provided
   useEffect(() => {
@@ -1250,12 +1225,13 @@ export default forwardRef<MapHandle, MapProps>(function Map(
   // Filter locations: if trips are active, only show trip-based locations
   // Also filter out locations that fall within photo clusters
   const visibleLocations = useMemo((): Location[] => {
-    let filtered = locations;
+    const baseLocations = isNativePlatform() ? nativeLocations : locations;
+    let filtered = baseLocations;
     
     // If at least one trip is active, only show locations that belong to active trips
     const activeTripIds = trips.filter(t => t.is_active).map(t => t.id);
     if (activeTripIds.length > 0) {
-      filtered = locations.filter((location) => {
+      filtered = baseLocations.filter((location) => {
         // Location must have trip_ids and at least one must be in activeTripIds
         return location.trip_ids && location.trip_ids.some(id => activeTripIds.includes(id));
       });
@@ -1298,7 +1274,7 @@ export default forwardRef<MapHandle, MapProps>(function Map(
     });
     
     return filtered.filter((_, index) => !excludedLocations.has(`location-${index}`));
-  }, [locations, trips, photoGroups, viewportThreshold]);
+  }, [locations, nativeLocations, trips, photoGroups, viewportThreshold]);
   
   // Group locations by trip_id and create polylines for each trip
   const tripPolylines = useMemo(() => {
@@ -1487,6 +1463,10 @@ export default forwardRef<MapHandle, MapProps>(function Map(
               markerColor = getTripColor(matchingTrip.id, tripIndex);
             }
           }
+          // Highlight locations that have not yet been uploaded to Firestore
+          if (location.uploaded === false) {
+            markerColor = "#f59e0b";
+          }
           
           // Use special icons for start and end, breadcrumb dots for the rest
           if (isStart && visibleLocations.length > 1) {
@@ -1528,6 +1508,9 @@ export default forwardRef<MapHandle, MapProps>(function Map(
               const tripIndex = trips.findIndex(t => t.id === matchingTrip.id);
               markerColor = getTripColor(matchingTrip.id, tripIndex);
             }
+          }
+          if (location.uploaded === false) {
+            markerColor = "#f59e0b";
           }
           return (
             <Marker

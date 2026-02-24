@@ -1,0 +1,25 @@
+{
+	"appId": "com.jeethtravel.app",
+	"appName": "Travel",
+	"webDir": "out",
+	"server": {
+		"androidScheme": "https"
+	},
+	"ios": {
+		"scheme": "Travel"
+	},
+	"plugins": {
+		"LocationPlugin": {
+			"source": "ios/App/App/LocationPlugin.swift"
+		}
+	},
+	"packageClassList": [
+		"MediaPlugin",
+		"AppPlugin",
+		"CAPCameraPlugin",
+		"FileViewerPlugin",
+		"FilesystemPlugin",
+		"PreferencesPlugin",
+		"LocationPlugin"
+	]
+}

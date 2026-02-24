@@ -3,6 +3,7 @@ import CoreLocation
 import BackgroundTasks
 import os.log
 
+
 /// Native BGAppRefreshTask that gets current location, updates or creates a location in Firestore,
 /// and writes back the latest location to UserDefaults. No WebView, JS, or Capacitor involvement.
 enum BackgroundLocationTask {
@@ -18,7 +19,7 @@ enum BackgroundLocationTask {
     private static let pendingKey = prefsPrefix + "jeethtravel.pending"
     private static let trackingKey = prefsPrefix + "jeethtravel.trackingEnabled"
     private static let proximityThresholdMeters: Double = 50
-    private static let locationTimeout: TimeInterval = 10
+    private static let locationTimeout: TimeInterval = 25
     private static let rescheduleInterval: TimeInterval = 60
 
     static func register() {
@@ -40,6 +41,8 @@ enum BackgroundLocationTask {
     }
 
     private static func handleTask(_ task: BGAppRefreshTask) {
+        print(">>> [SWIFT] HANDLETASK CALLED <<<")
+
         os_log("%{public}@ [SWIFT] Background location task started", log: logger, type: .info, logTimestamp())
         schedule()
 
@@ -58,53 +61,192 @@ enum BackgroundLocationTask {
         let m = CLLocationManager()
         m.desiredAccuracy = kCLLocationAccuracyBest
         m.distanceFilter = kCLDistanceFilterNone
+        m.pausesLocationUpdatesAutomatically = true
+        m.allowsBackgroundLocationUpdates = true
         return m
     }()
 
-    private static func run(completion: @escaping (Bool) -> Void) {
+    /// Ensure we have at least "Always" authorization so background tasks can request location.
+    /// Must be called from a foreground context (e.g. on app launch / didBecomeActive).
+    static func ensureAuthorization() {
+        DispatchQueue.main.async {
+            let status: CLAuthorizationStatus
+            if #available(iOS 14.0, *) {
+                status = locationManager.authorizationStatus
+            } else {
+                status = CLLocationManager.authorizationStatus()
+            }
+
+            switch status {
+            case .notDetermined:
+                os_log("%{public}@ [SWIFT] Requesting Always location authorization (notDetermined)", log: logger, type: .info, logTimestamp())
+                locationManager.requestAlwaysAuthorization()
+            case .authorizedWhenInUse:
+                os_log("%{public}@ [SWIFT] Requesting upgrade to Always location authorization (authorizedWhenInUse)", log: logger, type: .info, logTimestamp())
+                locationManager.requestAlwaysAuthorization()
+            default:
+                os_log("%{public}@ [SWIFT] Location authorization status: %{public}d", log: logger, type: .info, logTimestamp(), status.rawValue)
+            }
+        }
+    }
+
+    // MARK: - Handoff: continuous background tracking when bridge is torn down
+
+    private static var handoffLocationManager: CLLocationManager?
+    private static var handoffDelegate: HandoffLocationDelegate?
+
+    /// Start native-owned continuous location updates for background handoff. Call from AppDelegate
+    /// before replacing the bridge so tracking continues after the WebView is torn down.
+    static func startBackgroundTracking() {
+        let defaults = UserDefaults.standard
+        guard LocationStorage.isTrackingEnabled(defaults: defaults) else {
+            os_log("%{public}@ [SWIFT] Handoff: tracking disabled, not starting background tracking", log: logger, type: .info, logTimestamp())
+            return
+        }
+
+        DispatchQueue.main.async {
+            guard handoffLocationManager == nil else {
+                os_log("%{public}@ [SWIFT] Handoff: already running", log: logger, type: .info, logTimestamp())
+                return
+            }
+
+            let m = CLLocationManager()
+            m.desiredAccuracy = kCLLocationAccuracyBest
+            m.distanceFilter = kCLDistanceFilterNone
+            m.pausesLocationUpdatesAutomatically = true
+            m.allowsBackgroundLocationUpdates = true
+
+            let delegate = HandoffLocationDelegate { location in
+                recordLocation(location)
+            }
+            m.delegate = delegate
+            m.startUpdatingLocation()
+
+            handoffLocationManager = m
+            handoffDelegate = delegate
+            os_log("%{public}@ [SWIFT] Handoff: started continuous background location tracking", log: logger, type: .info, logTimestamp())
+        }
+    }
+
+    /// Stop native-owned continuous tracking. Call from AppDelegate when entering foreground
+    /// so the bridge/plugin can take over again.
+    static func stopBackgroundTracking() {
+        DispatchQueue.main.async {
+            guard let m = handoffLocationManager else { return }
+            m.stopUpdatingLocation()
+            m.delegate = nil
+            handoffLocationManager = nil
+            handoffDelegate = nil
+            os_log("%{public}@ [SWIFT] Handoff: stopped continuous background location tracking", log: logger, type: .info, logTimestamp())
+        }
+    }
+
+    /// Record one location to storage and optionally upload (shared with LocationPlugin behavior).
+    private static func recordLocation(_ location: CLLocation) {
         let defaults = UserDefaults.standard
 
-        // Respect tracking toggle from JS (Preferences / CapacitorStorage.jeethtravel.trackingEnabled).
-        if let trackingValue = defaults.string(forKey: trackingKey),
-           trackingValue.lowercased() != "true" {
-            os_log("%{public}@ [SWIFT] Tracking disabled in preferences, skipping run", log: logger, type: .info, logTimestamp())
+        guard let auth = LocationStorage.loadAuth(defaults: defaults),
+              !auth.idToken.isEmpty,
+              !auth.projectId.isEmpty else {
+            os_log("%{public}@ [SWIFT] Handoff: missing or invalid auth; storing locally only", log: logger, type: .info, logTimestamp())
+            storeLocationWithoutUpload(location: location)
+            return
+        }
+
+        var pending = LocationStorage.loadPendingLocations(defaults: defaults)
+
+        let userId: String
+        if let sub = decodeJWTSubject(auth.idToken) {
+            userId = sub
+        } else if let lastUserId = pending.last?.user_id, !lastUserId.isEmpty {
+            userId = lastUserId
+        } else {
+            os_log("%{public}@ [SWIFT] Handoff: could not determine user_id; skipping", log: logger, type: .info, logTimestamp())
+            return
+        }
+
+        var upserted = LocationStorage.appendOrUpdateLocation(
+            newLocation: location,
+            userId: userId,
+            pending: &pending
+        )
+        LocationStorage.savePendingLocations(pending, defaults: defaults)
+
+        patchFirestore(projectId: auth.projectId, idToken: auth.idToken, location: upserted) { success in
+            if let idx = pending.firstIndex(where: { $0.id == upserted.id }) {
+                upserted.uploaded = success
+                pending[idx] = upserted
+                LocationStorage.savePendingLocations(pending, defaults: defaults)
+            }
+            if success {
+                os_log("%{public}@ [SWIFT] Handoff Firestore patch succeeded for id=%{public}@", log: logger, type: .info, logTimestamp(), upserted.id)
+            } else {
+                os_log("%{public}@ [SWIFT] Handoff Firestore patch failed for id=%{public}@", log: logger, type: .error, logTimestamp(), upserted.id)
+            }
+        }
+    }
+
+    private static func storeLocationWithoutUpload(location: CLLocation) {
+        let defaults = UserDefaults.standard
+        var pending = LocationStorage.loadPendingLocations(defaults: defaults)
+
+        guard let userId = pending.last?.user_id, !userId.isEmpty else {
+            os_log("%{public}@ [SWIFT] Handoff: could not determine user_id for local-only store; skipping", log: logger, type: .info, logTimestamp())
+            return
+        }
+
+        _ = LocationStorage.appendOrUpdateLocation(
+            newLocation: location,
+            userId: userId,
+            pending: &pending
+        )
+        LocationStorage.savePendingLocations(pending, defaults: defaults)
+    }
+
+    private static func run(completion: @escaping (Bool) -> Void) {
+        print(">>> [SWIFT] BACKGROUND TASK RUN CALLED <<<")
+
+        let defaults = UserDefaults.standard
+
+        // Respect tracking toggle from JS/native (Preferences / CapacitorStorage.jeethtravel.trackingEnabled).
+        // Only run when the user has explicitly enabled tracking.
+        if !LocationStorage.isTrackingEnabled(defaults: defaults) {
+            let rawValue = defaults.string(forKey: trackingKey) ?? "nil"
+            os_log("%{public}@ [SWIFT] Tracking disabled in preferences (value=%{public}@), skipping run", log: logger, type: .info, logTimestamp(), rawValue)
             completion(true)
             return
         }
 
-        guard let authJson = defaults.string(forKey: authKey),
-              let authData = authJson.data(using: .utf8),
-              let auth = try? JSONDecoder().decode(FirebaseAuth.self, from: authData),
-              !auth.idToken.isEmpty,
-              !auth.projectId.isEmpty else {
+        guard var currentAuth = LocationStorage.loadAuth(defaults: defaults),
+              !currentAuth.idToken.isEmpty,
+              !currentAuth.projectId.isEmpty else {
             os_log("%{public}@ [SWIFT] Missing or invalid auth, skipping", log: logger, type: .info, logTimestamp())
             completion(true)
             return
         }
 
-        var currentAuth = auth
-        if isTokenExpired(auth.idToken) {
-            guard let refreshed = refreshToken(apiKey: auth.apiKey, refreshToken: auth.refreshToken ?? ""),
+        let originalAuth = currentAuth
+        if isTokenExpired(currentAuth.idToken) {
+            guard let refreshed = refreshToken(apiKey: currentAuth.apiKey, refreshToken: currentAuth.refreshToken ?? ""),
                   !refreshed.idToken.isEmpty else {
                 os_log("%{public}@ [SWIFT] Token refresh failed, skipping", log: logger, type: .info, logTimestamp())
                 completion(true)
                 return
             }
             currentAuth = FirebaseAuth(
-                projectId: auth.projectId,
+                projectId: originalAuth.projectId,
                 idToken: refreshed.idToken,
-                refreshToken: refreshed.refreshToken ?? auth.refreshToken,
-                apiKey: auth.apiKey
+                refreshToken: refreshed.refreshToken ?? originalAuth.refreshToken,
+                apiKey: originalAuth.apiKey
             )
-            if let updated = try? JSONEncoder().encode(currentAuth), let str = String(data: updated, encoding: .utf8) {
-                defaults.set(str, forKey: authKey)
-            }
+            LocationStorage.saveAuth(currentAuth, defaults: defaults)
         }
 
         requestLocation { result in
             switch result {
-            case .failure:
-                os_log("%{public}@ [SWIFT] Location request failed", log: logger, type: .info, logTimestamp())
+            case .failure(let error):
+                let message = (error as NSError).userInfo[NSLocalizedDescriptionKey] as? String ?? error.localizedDescription
+                os_log("%{public}@ [SWIFT] Location request failed (%{public}@), will retry on next background run", log: logger, type: .info, logTimestamp(), message)
                 completion(true)
                 return
             case .success(let location):
@@ -112,22 +254,12 @@ enum BackgroundLocationTask {
                 let lng = location.coordinate.longitude
                 let now = Date()
                 let nowISO = ISO8601DateFormatter().string(from: now)
-
-                var pending: [PendingLocation] = []
-                if let pendingJson = defaults.string(forKey: pendingKey),
-                   let data = pendingJson.data(using: .utf8),
-                   let decoded = try? JSONDecoder().decode([PendingLocation].self, from: data) {
-                    pending = decoded
-                }
-
-                let last = pending.max(by: { (a, b) in
-                    (ISO8601DateFormatter().date(from: a.timestamp) ?? .distantPast) < (ISO8601DateFormatter().date(from: b.timestamp) ?? .distantPast)
-                })
+                var pending = LocationStorage.loadPendingLocations(defaults: defaults)
 
                 let userId: String
                 if let sub = decodeJWTSubject(currentAuth.idToken) {
                     userId = sub
-                } else if let lastUserId = last?.user_id, !lastUserId.isEmpty {
+                } else if let lastUserId = pending.last?.user_id, !lastUserId.isEmpty {
                     userId = lastUserId
                 } else {
                     os_log("%{public}@ [SWIFT] Could not determine user_id", log: logger, type: .info, logTimestamp())
@@ -135,91 +267,21 @@ enum BackgroundLocationTask {
                     return
                 }
 
-                if let last = last,
-                   abs(last.latitude - lat) <= 0.01,
-                   abs(last.longitude - lng) <= 0.01 {
-                    let lastTs = ISO8601DateFormatter().date(from: last.timestamp) ?? now
-                    let timeDiff = Int(now.timeIntervalSince(lastTs))
-                    let newWaitTime = (last.wait_time ?? 0) + timeDiff
-                    var updated = PendingLocation(
-                        id: last.id,
-                        user_id: last.user_id,
-                        latitude: lat,
-                        longitude: lng,
-                        timestamp: nowISO,
-                        wait_time: newWaitTime,
-                        trip_ids: last.trip_ids,
-                        created_at: last.created_at ?? nowISO,
-                        uploaded: false
-                    )
-                    if let idx = pending.firstIndex(where: { $0.id == last.id }) {
-                        pending[idx] = updated
-                    } else {
-                        pending.append(updated)
-                    }
-                    if let data = try? JSONEncoder().encode(pending), let str = String(data: data, encoding: .utf8) {
-                        defaults.set(str, forKey: pendingKey)
-                    }
+                var upserted = LocationStorage.appendOrUpdateLocation(
+                    newLocation: location,
+                    userId: userId,
+                    pending: &pending,
+                    now: now
+                )
+                LocationStorage.savePendingLocations(pending, defaults: defaults)
 
-                    patchFirestore(projectId: currentAuth.projectId, idToken: currentAuth.idToken, location: updated) { patchSuccess in
-                        if patchSuccess {
-                            if let idx = pending.firstIndex(where: { $0.id == updated.id }) {
-                                updated.uploaded = true
-                                pending[idx] = updated
-                                if let data = try? JSONEncoder().encode(pending), let str = String(data: data, encoding: .utf8) {
-                                    defaults.set(str, forKey: pendingKey)
-                                }
-                            }
-                        } else {
-                            if let idx = pending.firstIndex(where: { $0.id == updated.id }) {
-                                updated.uploaded = false
-                                pending[idx] = updated
-                                if let data = try? JSONEncoder().encode(pending), let str = String(data: data, encoding: .utf8) {
-                                    defaults.set(str, forKey: pendingKey)
-                                }
-                            }
-                        }
-                        completion(patchSuccess)
+                patchFirestore(projectId: currentAuth.projectId, idToken: currentAuth.idToken, location: upserted) { patchSuccess in
+                    if let idx = pending.firstIndex(where: { $0.id == upserted.id }) {
+                        upserted.uploaded = patchSuccess
+                        pending[idx] = upserted
+                        LocationStorage.savePendingLocations(pending, defaults: defaults)
                     }
-                } else {
-                    let newId = "loc_\(Int(now.timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8))"
-                    let tripIds = last?.trip_ids
-                    var newLoc = PendingLocation(
-                        id: newId,
-                        user_id: userId,
-                        latitude: lat,
-                        longitude: lng,
-                        timestamp: nowISO,
-                        wait_time: 0,
-                        trip_ids: tripIds,
-                        created_at: nowISO,
-                        uploaded: false
-                    )
-                    pending.append(newLoc)
-                    if let data = try? JSONEncoder().encode(pending), let str = String(data: data, encoding: .utf8) {
-                        defaults.set(str, forKey: pendingKey)
-                    }
-
-                    patchFirestore(projectId: currentAuth.projectId, idToken: currentAuth.idToken, location: newLoc) { patchSuccess in
-                        if patchSuccess {
-                            if let idx = pending.firstIndex(where: { $0.id == newLoc.id }) {
-                                newLoc.uploaded = true
-                                pending[idx] = newLoc
-                                if let data = try? JSONEncoder().encode(pending), let str = String(data: data, encoding: .utf8) {
-                                    defaults.set(str, forKey: pendingKey)
-                                }
-                            }
-                        } else {
-                            if let idx = pending.firstIndex(where: { $0.id == newLoc.id }) {
-                                newLoc.uploaded = false
-                                pending[idx] = newLoc
-                                if let data = try? JSONEncoder().encode(pending), let str = String(data: data, encoding: .utf8) {
-                                    defaults.set(str, forKey: pendingKey)
-                                }
-                            }
-                        }
-                        completion(patchSuccess)
-                    }
+                    completion(patchSuccess)
                 }
             }
         }
@@ -231,12 +293,27 @@ enum BackgroundLocationTask {
         let queue = DispatchQueue(label: "com.jeethtravel.location")
         var done = false
 
-        let handler: (CLLocation?) -> Void = { loc in
+        let handler: (Result<CLLocation, Error>) -> Void = { res in
             queue.async {
                 guard !done else { return }
                 done = true
-                if let loc = loc {
-                    result = .success(loc)
+                result = res
+                if case .success(let loc) = res {
+                    let lat = loc.coordinate.latitude
+                    let lng = loc.coordinate.longitude
+                    os_log(
+                        "%{public}@ [SWIFT] BackgroundLocationTask didUpdateLocations lat=%{public}.6f lng=%{public}.6f",
+                        log: logger,
+                        type: .info,
+                        logTimestamp(),
+                        lat,
+                        lng
+                    )
+                }
+                DispatchQueue.main.async {
+                    locationManager.stopUpdatingLocation()
+                    locationManager.delegate = nil
+                    objc_setAssociatedObject(locationManager, &locationDelegateKey, nil, .OBJC_ASSOCIATION_RETAIN)
                 }
                 sem.signal()
             }
@@ -246,17 +323,22 @@ enum BackgroundLocationTask {
             let delegate = LocationDelegate(handler: handler)
             objc_setAssociatedObject(locationManager, &locationDelegateKey, delegate, .OBJC_ASSOCIATION_RETAIN)
             locationManager.delegate = delegate
-            locationManager.requestLocation()
+            locationManager.startUpdatingLocation()
         }
 
         queue.async {
-            _ = sem.wait(timeout: .now() + locationTimeout)
-            if !done {
+            let timeoutResult = sem.wait(timeout: .now() + locationTimeout)
+            if timeoutResult == .timedOut && !done {
                 done = true
+                result = .failure(NSError(domain: "BackgroundLocationTask", code: -1, userInfo: [NSLocalizedDescriptionKey: "timeout"]))
+                DispatchQueue.main.async {
+                    locationManager.stopUpdatingLocation()
+                    locationManager.delegate = nil
+                    objc_setAssociatedObject(locationManager, &locationDelegateKey, nil, .OBJC_ASSOCIATION_RETAIN)
+                }
             }
-            DispatchQueue.main.async {
-                locationManager.delegate = nil
-                objc_setAssociatedObject(locationManager, &locationDelegateKey, nil, .OBJC_ASSOCIATION_RETAIN)
+            if case .failure(let err) = result {
+                os_log("%{public}@ [SWIFT] requestLocation failed: %{public}@", log: logger, type: .info, logTimestamp(), err.localizedDescription)
             }
             completion(result)
         }
@@ -309,6 +391,16 @@ enum BackgroundLocationTask {
         return result
     }
 
+    #if DEBUG
+    /// Debug helper to run the background task logic from the foreground app.
+    static func debugRunFromForeground() {
+        os_log("%{public}@ [SWIFT] [DEBUG] BackgroundLocationTask debug run started", log: logger, type: .info, logTimestamp())
+        run { success in
+            os_log("%{public}@ [SWIFT] [DEBUG] BackgroundLocationTask debug run completed, success=%{public}@", log: logger, type: .info, logTimestamp(), success ? "true" : "false")
+        }
+    }
+    #endif
+
     private static func distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double) -> Double {
         let R = 6_371_000.0
         let dLat = (lat2 - lat1) * .pi / 180
@@ -318,7 +410,7 @@ enum BackgroundLocationTask {
         return R * c
     }
 
-    private static func patchFirestore(projectId: String, idToken: String, location: PendingLocation, completion: @escaping (Bool) -> Void) {
+    static func patchFirestore(projectId: String, idToken: String, location: PendingLocation, completion: @escaping (Bool) -> Void) {
         let base = "https://firestore.googleapis.com/v1/projects/\(projectId)/databases/(default)/documents/locations/\(location.id)"
         var fieldPaths = ["user_id", "latitude", "longitude", "timestamp", "wait_time"]
         if location.trip_ids != nil && !(location.trip_ids?.isEmpty ?? true) {
@@ -357,32 +449,28 @@ enum BackgroundLocationTask {
 
 private var locationDelegateKey: UInt8 = 0
 
-private class LocationDelegate: NSObject, CLLocationManagerDelegate {
-    let handler: (CLLocation?) -> Void
-    init(handler: @escaping (CLLocation?) -> Void) { self.handler = handler }
+private class HandoffLocationDelegate: NSObject, CLLocationManagerDelegate {
+    let onLocation: (CLLocation) -> Void
+    init(onLocation: @escaping (CLLocation) -> Void) { self.onLocation = onLocation }
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        handler(locations.last)
+        if let loc = locations.last {
+            onLocation(loc)
+        }
     }
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        handler(nil)
+        // Log but keep running so we can get the next update
     }
 }
 
-private struct FirebaseAuth: Codable {
-    let projectId: String
-    let idToken: String
-    let refreshToken: String?
-    let apiKey: String?
-}
-
-private struct PendingLocation: Codable {
-    let id: String
-    let user_id: String
-    let latitude: Double
-    let longitude: Double
-    let timestamp: String
-    let wait_time: Int?
-    let trip_ids: [String]?
-    let created_at: String?
-    var uploaded: Bool?
+private class LocationDelegate: NSObject, CLLocationManagerDelegate {
+    let handler: (Result<CLLocation, Error>) -> Void
+    init(handler: @escaping (Result<CLLocation, Error>) -> Void) { self.handler = handler }
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        if let loc = locations.last {
+            handler(.success(loc))
+        }
+    }
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        handler(.failure(error))
+    }
 }

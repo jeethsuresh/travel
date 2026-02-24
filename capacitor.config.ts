@@ -1,4 +1,3 @@
-/// <reference types="@capacitor/background-runner" />
 import type { CapacitorConfig } from "@capacitor/cli";
 
 const config: CapacitorConfig = {
@@ -11,18 +10,11 @@ const config: CapacitorConfig = {
   ios: {
     scheme: "Travel",
   },
-  // Minimal BackgroundRunner config so the plugin does not throw noRunnerConfig when app enters background.
-  // autoStart: false prevents the plugin from scheduling the JS runner; only native Swift BackgroundLocationTask runs.
   plugins: {
-    BackgroundRunner: {
-      label: "com.jeethtravel.app.uploadLocations",
-      src: "runners/background.js",
-      event: "uploadPendingLocations",
-      repeat: false,
-      autoStart: false,
-      interval: 1,
+    LocationPlugin: {
+      source: "ios/App/App/LocationPlugin.swift",
     },
-  },
+  }
 };
 
 export default config;

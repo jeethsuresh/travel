@@ -337,8 +337,8 @@ export default function Home() {
     }
   }, [user, fetchLocations, fetchPhotos]);
 
-  // Sync pending locations + Firebase auth to Preferences so Swift background task (and JS when active) can use the same path
-  const syncPendingToPreferencesForRunner = useCallback(async () => {
+  // Sync pending locations + Firebase auth to Preferences so Swift background task can use the same path
+  const syncPendingToPreferences = useCallback(async () => {
     if (!isNativePlatform() || !user) return;
     const auth = getFirebaseAuth();
     if (!auth?.currentUser) return;
@@ -397,17 +397,17 @@ export default function Home() {
         value: JSON.stringify(merged),
       });
     } catch (e) {
-      console.warn("[Location:Preferences] sync for runner failed", e);
+      console.warn("[Location:Preferences] sync to Preferences failed", e);
     }
   }, [user]);
 
   useEffect(() => {
     if (!isNativePlatform() || !user) return;
     const intervalMs = 15 * 1000;
-    const id = setInterval(syncPendingToPreferencesForRunner, intervalMs);
-    syncPendingToPreferencesForRunner();
+    const id = setInterval(syncPendingToPreferences, intervalMs);
+    syncPendingToPreferences();
     return () => clearInterval(id);
-  }, [user, syncPendingToPreferencesForRunner]);
+  }, [user, syncPendingToPreferences]);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -515,13 +515,13 @@ export default function Home() {
           console.warn("[Location:onActive] apply failed", e);
         }
       } else {
-        syncPendingToPreferencesForRunner();
+        syncPendingToPreferences();
       }
     });
     return () => {
       listenerPromise.then((l) => l.remove()).catch(() => {});
     };
-  }, [user?.id, syncPendingToPreferencesForRunner, fetchLocations]);
+  }, [user?.id, syncPendingToPreferences, fetchLocations]);
 
   useEffect(() => {
     return () => {
@@ -591,7 +591,7 @@ export default function Home() {
           trips={activeTrips}
           onLocationUpdate={fetchLocations}
           focusLocation={focusLocation}
-          onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferencesForRunner : undefined}
+          onPendingLocationsChange={isNativePlatform() ? syncPendingToPreferences : undefined}
           onTrackingChange={setTrackingState}
           onLocationSaved={handleLocationSaved}
         />

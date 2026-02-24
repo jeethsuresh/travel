@@ -14,10 +14,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         let startTime = Date()
+        print(">>> [SWIFT] didFinishLaunching CALLED <<<")
+
         os_log("%{public}@ [SWIFT] [STARTUP] AppDelegate.application(didFinishLaunchingWithOptions) called at %{public}s", log: logger, type: .info, logTimestamp(), ISO8601DateFormatter().string(from: startTime))
         
         BackgroundLocationTask.register()
         os_log("%{public}@ [SWIFT] [STARTUP] Swift background location task registered", log: logger, type: .info, logTimestamp())
+        
+        // Ensure we request "Always" location permission from a foreground context.
+        BackgroundLocationTask.ensureAuthorization()
+        os_log("%{public}@ [SWIFT] [STARTUP] ensureAuthorization invoked", log: logger, type: .info, logTimestamp())
         
         // Launch options are not forwarded to the (disabled) JS Background Runner; only native Swift task runs.
         
@@ -40,18 +46,44 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func applicationDidEnterBackground(_ application: UIApplication) {
         os_log("%{public}@ [SWIFT] [LIFECYCLE] applicationDidEnterBackground called", log: logger, type: .info, logTimestamp())
-        // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
-        // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
+
+        // Hand off to native continuous tracking before tearing down the bridge so location keeps updating.
+        BackgroundLocationTask.startBackgroundTracking()
+        os_log("%{public}@ [SWIFT] [LIFECYCLE] Handoff started (native tracking active)", log: logger, type: .info, logTimestamp())
+
+        // Replace the bridge VC with a placeholder so the WebView is deallocated and the entire JS engine is torn down.
+        guard let window = window else { return }
+        guard window.rootViewController is CAPBridgeViewController else { return }
+        let placeholder = UIViewController()
+        placeholder.view.backgroundColor = .systemBackground
+        window.rootViewController = placeholder
+        os_log("%{public}@ [SWIFT] [LIFECYCLE] Bridge VC replaced with placeholder (JS engine stopped)", log: logger, type: .info, logTimestamp())
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {
         os_log("%{public}@ [SWIFT] [LIFECYCLE] applicationWillEnterForeground called", log: logger, type: .info, logTimestamp())
-        // Called as part of the transition from the background to the active state; here you can undo many of the changes made on entering the background.
+
+        // Stop native handoff tracking so the bridge/plugin can take over again.
+        BackgroundLocationTask.stopBackgroundTracking()
+        os_log("%{public}@ [SWIFT] [LIFECYCLE] Handoff stopped", log: logger, type: .info, logTimestamp())
+
+        // Restart the JS engine by creating a new bridge VC and loading the app.
+        guard let window = window else { return }
+        guard !(window.rootViewController is CAPBridgeViewController) else { return }
+        let bridgeVC = CAPBridgeViewController()
+        window.rootViewController = bridgeVC
+        os_log("%{public}@ [SWIFT] [LIFECYCLE] New bridge VC set (JS engine restarted)", log: logger, type: .info, logTimestamp())
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         os_log("%{public}@ [SWIFT] [LIFECYCLE] applicationDidBecomeActive called", log: logger, type: .info, logTimestamp())
-        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+
+        #if DEBUG
+        // Trigger the background location task logic once from the foreground for debugging.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            BackgroundLocationTask.debugRunFromForeground()
+        }
+        #endif
     }
 
     func applicationWillTerminate(_ application: UIApplication) {
